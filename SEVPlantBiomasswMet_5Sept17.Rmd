@@ -1,0 +1,486 @@
+---
+title: "SEV_PlantBiomassRegressions_Climate Effects"
+author: "AJ"
+date: '`r Sys.time()`'
+output: html_document
+---
+
+##Background
+Several long-term studies at the Sevilleta LTER measure net primary production (NPP) across ecosystems and treatments. Net primary production is a fundamental ecological variable that quantifies rates of carbon consumption and fixation. Estimates of NPP are important in understanding energy flow at a community level as well as spatial and temporal responses to a range of ecological processes. Above-ground net primary production (ANPP) is the change in plant biomass, including loss to death and decomposition, over a given period of time. To measure this change, vegetation variables, including species composition and the cover and height of individuals, are sampled up to three times yearly (winter, spring, and fall) at permanent plots within a study site. Sevilleta LTER dataset 157 includes cover, height, and dry biomass measurements obtained through destructive harvesting. These species are always harvested from habitat comparable to the plots in which they were recorded.
+
+##Purpose
+The following R code utilizes volume (cover x height) and weight data from Sev dataset 157 to create regressions which can be used to estimate seasonal biomass for plant species across the Sevilleta.
+
+An initial round of analyses were done using Year, Season, Site, and Treatment as factor-type covariates when exploring the Volume:Biomass relationship. All four factors were found to significantly interact with Volume in many species. To further explore how these factors affect Volume:Biomass regressions, we are incorporating meteorological data in place of the "Year" factor. 
+
+```{r load.packages, include=FALSE}
+# Load R packages which will be used in this script
+library(ggplot2)
+library(lubridate)
+library(plyr)
+library(reshape2)
+library(gridExtra)
+library(cowplot)
+library(knitr)
+library(markdown)
+library(xtable)
+library(zoo)
+library(tidyr)
+library(stats)
+library(car)
+library(nlme)
+library(visreg)
+```
+
+### Step 1: Preparing the data
+SEV dataset 157 (version 20161218) is used here.
+
+```{r, include = F}
+# Read in SEV 157 data
+dest.harv.raw <- read.csv("/Users/alesia/Documents/Project_SevPublicPlantRCode/sev157_nppweight_20161218.csv", strip.white = T)
+
+# Read in met data (provided in 4 Sept 2017 email from Jen to Alesia)
+met.workup <- read.csv("/Users/alesia/Documents/Project_SevPublicPlantRCode/Met072217.csv", strip.white = T)
+
+# Read in SPEI file (provided in 4 Sept 2017 email from Jen to Alesia)
+spei.data <- read.csv("/Users/alesia/Documents/Project_SevPublicPlantRCode/SPEI_MET.csv", strip.white = T)
+
+```
+
+```{r include = F}
+# Look at SEV 157 data
+summary(dest.harv.raw)
+
+# Modify column names
+names(dest.harv.raw)[names(dest.harv.raw) == "Species"] <- "kartez"
+
+# Convert error data to NA's
+dest.harv <- dest.harv.raw[,1:14]
+dest.harv$Treatment[dest.harv$Treatment == ""] <- NA
+dest.harv$Observation[dest.harv$Observation < 1] <- NA
+dest.harv$Count[is.na(dest.harv$Count)] <- 0
+dest.harv$Cover[dest.harv$Cover < 0.01 | dest.harv$Cover > 100] <- NA
+dest.harv$Height[dest.harv$Height < 1] <- NA
+dest.harv$Live_Weight[dest.harv$Live_Weight < 0.01] <- NA
+dest.harv$Live_Weight[dest.harv$Live_Weight < 0] <- NA
+
+# Calculate volume
+dest.harv$Volume <- dest.harv$Cover * dest.harv$Height
+
+# Duplicate rows with Counts greater than 1
+dest.harv.extend <- dest.harv[rep(row.names(dest.harv), dest.harv$Count), c("Year", "Season", "Date", "Site", "Treatment", "kartez", "Cover", "Height", "Live_Weight", "Volume")]
+
+# Arrange by species name in alphabetical order
+dest.harv.extend <- dest.harv.extend[with(dest.harv.extend, order(kartez, Year, Season)),]
+
+# Get rid of a few sneaky "species"
+#unique(dest.harv.extend$kartez)
+dest.harv.extend <- dest.harv.extend[
+  dest.harv.extend$kartez != "UKFO10" &
+    dest.harv.extend$kartez != "UKFO13" &
+    dest.harv.extend$kartez != "UKFO17" &
+    dest.harv.extend$kartez != "UKFO18" &
+    dest.harv.extend$kartez != "UKFO75" &
+    dest.harv.extend$kartez != "UKFO80" &
+    dest.harv.extend$kartez != "UKSH5" &
+    dest.harv.extend$kartez != "FORB1",]
+
+# Make a SiteCluster column
+dest.harv.extend$SiteCluster <- revalue(dest.harv.extend$Site, c(
+  "C" = "L",
+  "G" = "L",
+  "CG" = "L",
+  "B" = "L",
+  "P" = "PJ",
+  "J" = "PJ"))
+
+# Burn treatment effects more useful if coded as "years since burn"
+#summary(as.factor(dest.harv.extend$Year[dest.harv.extend$Treatment == "B"]))
+# Assume that all sites were burned in 1980
+dest.harv.extend$SinceBurn <-
+  dest.harv.extend$Year - 1980
+# After 2009 fire, "Control" collections came from area burned in 2003
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "C" & 
+                             dest.harv.extend$Site == "L" & 
+                             dest.harv.extend$Year > 2009] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "C" &
+                          dest.harv.extend$Site == "L" &
+                          dest.harv.extend$Year > 2009] - 2003
+# Before 2009 fire, "Burn" collections came from area burned in 2003
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Year < 2010] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "B" &
+                          dest.harv.extend$Year < 2010] - 2003
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Date == "10/20/2009"] <- 0
+# After 2009 fire, "Burn" collections came from area burned in 2009
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Year > 2009] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "B" &
+                          dest.harv.extend$Year > 2009] - 2009
+
+#unique(dest.harv.extend[dest.harv.extend$Site=="L", c("Year", "Site", "SinceBurn", "Treatment")])
+
+```
+
+
+```{r include=F}
+# Look at the met and SPEI data
+summary(met.workup)
+summary(spei.data)
+
+# Format columns
+met.workup$Sta <- as.factor(met.workup$Sta)
+spei.data$Sta <- as.factor(spei.data$Sta)
+
+# Subset to the columns we'll be using. Separate spring and monsoon numbers
+monsoon.met.workup <- met.workup[,c("Sta", "water_year", "monsoon", "GDD")]
+colnames(monsoon.met.workup) <- c("MetStation", "Year", "season.precip", "GDD")
+monsoon.met.workup$Season <- 3
+spring.met.workup <- met.workup[,c("Sta", "water_year", "tri_two", "GDD")]
+colnames(spring.met.workup) <- c("MetStation", "Year", "season.precip", "GDD")
+spring.met.workup$Season <- 2
+met.workup <- rbind(monsoon.met.workup, spring.met.workup)
+
+# 2016 precip is way too high?
+met.workup[met.workup$Year == 2016,"season.precip"]
+# so divide it by 100 for now...
+met.workup[met.workup$Year == 2016,"season.precip"] <- met.workup[met.workup$Year == 2016,"season.precip"] / 100
+
+monsoon.spei.data <- spei.data[spei.data$Month == 9,
+                               c("Sta", "Year", "SPEI_6mo")]
+monsoon.spei.data$Season <- 3
+spring.spei.data <- spei.data[spei.data$Month == 4,
+                              c("Sta", "Year", "SPEI_6mo")]
+spring.spei.data$Season <- 2
+spei.data <- rbind(monsoon.spei.data, spring.spei.data)
+colnames(spei.data) <- c("MetStation", "Year", "SPEI_6mo", "Season")
+
+
+# Merge met and SPEI data
+met.spei <- merge(met.workup, spei.data, by = c("MetStation", "Year", "Season"), all = T)
+
+```
+
+```{r include = F}
+# Add column connecting each plant collection site to the nearest met station
+unique(dest.harv.extend$Site)
+dest.harv.extend$MetStation <- 
+  revalue(dest.harv.extend$Site,
+          c(L = 40, # Deep well
+            P = 42, PJ = 42, J = 42, # Cerro Montosa PJ
+            G = 49, C = 49, CG = 49, # Five Points
+            B = 50)) # Blue grama
+
+# Merge the plant and met data
+plant.met.data <- merge(dest.harv.extend[dest.harv.extend$Season != 1,], met.spei, 
+                        by = c("Year", "Season", "MetStation"), all.x=T)
+
+# Five Points and Savannah sites don't have complete met data for 1999. Blue grama site doesn't have complete met data for 2002. Fill using nearest met station 
+unique(plant.met.data[is.na(plant.met.data$season.precip), c("Year", "Season", "MetStation", "Site")])
+dest.harv.extend$MetStation[dest.harv.extend$MetStation == 49 &
+                              dest.harv.extend$Year == 1999] <- 40
+dest.harv.extend$MetStation[dest.harv.extend$MetStation == 50 &
+                              dest.harv.extend$Year == 2002] <- 42
+
+# Merge the plant and met data again. This time, there shouldn't be any NA met data
+plant.met.data <- merge(dest.harv.extend[dest.harv.extend$Season != 1,], met.spei, 
+                        by = c("Year", "Season", "MetStation"), all.x=T)
+
+```
+
+
+```{r echo=F, fig.height=2.7, fig.width=2.7}
+
+# Now we need to z-score our climate variables
+# First, assess distribution of data
+z.scores.spring <- unique(plant.met.data[plant.met.data$Season == 2, c("Year", "MetStation", "Season", "SPEI_6mo", "GDD", "season.precip")])
+hist(z.scores.spring$SPEI_6mo, main="Spring SPEI_6mo", xlab="SPEI_6mo")
+hist(z.scores.spring$GDD, main="Spring GDD", xlab="GDD")
+hist(z.scores.spring$season.precip, main="Spring precip", xlab="season.precip")
+
+z.scores.monsoon <- unique(plant.met.data[plant.met.data$Season == 3, c("Year", "MetStation", "Season", "SPEI_6mo", "GDD", "season.precip")])
+hist(z.scores.monsoon$SPEI_6mo, main="Monsoon SPEI_6mo", xlab="SPEI_6mo")
+hist(z.scores.monsoon$GDD, main="Monsoon GDD", xlab="GDD")
+hist(z.scores.monsoon$season.precip, main="Monsoon precip", xlab="season.precip")
+
+z.scores.spring[,c("z.SPEI", "z.GDD", "z.precip")] <- 
+  c(scale(z.scores.spring$SPEI_6mo, center=T, scale=T),
+    scale(z.scores.spring$GDD, center=T, scale=T),
+    scale(z.scores.spring$season.precip, center=T, scale=T))
+
+z.scores.monsoon[,c("z.SPEI", "z.GDD", "z.precip")] <- 
+  c(scale(z.scores.monsoon$SPEI_6mo, center=T, scale=T),
+    scale(z.scores.monsoon$GDD, center=T, scale=T),
+    scale(z.scores.monsoon$season.precip, center=T, scale=T))
+
+z.scores <- rbind(z.scores.spring, z.scores.monsoon)
+  
+plant.met.data <- merge(plant.met.data, z.scores, by = c("Year", "MetStation", "Season", "SPEI_6mo", "GDD", "season.precip"), all=T)
+
+```
+
+The data look like this:
+
+```{r, echo=F}
+# The data look like this
+kable(head((plant.met.data), format="pandoc"))
+```
+
+```{r}
+# Create full matrix for model output
+model.coefs.all <- data.frame(
+  kartez = as.factor(NA), 
+  Year = as.factor(NA),
+  Season = as.factor(NA),
+  Beta.Volume = NA,
+  SE = NA,
+  p.value = NA,
+  AdjR = NA)
+```
+
+We will consider the following species:
+
+```{r, echo=F, results="asis", warning=F, fig.height=3, fig.width=4.5}
+# Order dataset by species in alphabetical order
+plant.met.data <- plant.met.data[with(plant.met.data, order(kartez)),]
+
+all.slopes <- NA
+
+# Loop through all species
+#for (species in 1:length(unique(plant.met.data$kartez))) {
+for (species in 18:25) {
+  # Create subset dataframe for that species
+    # Only use samples from areas unburned for at least 5 years.
+  sp.sub <- unique(plant.met.data[plant.met.data$kartez ==
+                                    unique(plant.met.data$kartez)[species] &
+                                    plant.met.data$SinceBurn > 5 &
+                                    !is.na(plant.met.data$Volume) &
+                                    !is.na(plant.met.data$Live_Weight),])
+  
+  # Loop through each unique Season
+  for (season in 1:length(unique(sp.sub$Season))) {
+    SpSe.sub <- unique(sp.sub[sp.sub$Season ==
+                  unique(sp.sub$Season)[season],])
+    
+    # Go to next season if sample size less than 20
+    if (length(rownames(SpSe.sub)) < 20) {next}
+    
+    # Print summary of species' destructive harvest data
+    # Species:
+    cat("  \n\n### Species:", as.character(unique(SpSe.sub$kartez)))
+    # Season:
+    cat("  \n\n#### Season:", as.character(unique(SpSe.sub$Season)))
+    # Number of observations:
+    cat("  \n Number of observations:", length(rownames(SpSe.sub)))
+    # Sites collected:
+    cat("  \n Sites:", unique(as.character(SpSe.sub$Site)))
+    # Years collected:
+    cat("  \n Years collected:", unique(as.character(SpSe.sub$Year)))
+    # Size range:
+    cat("  \n *Size range*:")
+    cat("  \n - Cover:", min(SpSe.sub$Cover, na.rm=T), " - ", max(SpSe.sub$Cover, na.rm=T))
+    cat("  \n - Height:", min(SpSe.sub$Height, na.rm=T), " - ", max(SpSe.sub$Height, na.rm=T))
+    cat("  \n - Volume:", min(SpSe.sub$Volume, na.rm=T), " - ", max(SpSe.sub$Volume, na.rm=T))
+    cat("  \n - Weight:", min(SpSe.sub$Live_Weight, na.rm=T), " - ", max(SpSe.sub$Live_Weight, na.rm=T), "  \n")
+    
+    # Format Season and Year columns
+    SpSe.sub$Season <- as.factor(SpSe.sub$Season)
+    SpSe.sub$Year <- as.factor(SpSe.sub$Year)
+    
+    # Before this, z-score the climate variables
+    # First, determine if there is a year effect. Print "yes" or "no"
+    # Then consider 3 models with different "climate" terms
+    # Determine if they have testable effects. Print "yes" or "no"
+    # Output models with AIC values to determine variable with most explanatory power
+    # Does climate explain away site differences?
+    
+    # Test for stand-alone year effect
+    
+    # Create list of covariates possible for this species
+    SPEI.covariates <- unique(SpSe.sub[,c("Year", "Season", "SPEI_6mo", "z.SPEI")])
+    GDD.covariates <- unique(SpSe.sub[,c("Year", "Season", "GDD", "z.GDD")])
+    precip.covariates <- unique(SpSe.sub[,c("Year", "Season", "season.precip", "z.precip")])
+    
+    # Skip this species-season if all three climate variables can't be compared
+    if (length(!is.na(SPEI.covariates$z.SPEI)) < 3 |
+        length(!is.na(GDD.covariates$z.GDD)) < 3 |
+        length(!is.na(precip.covariates$z.precip)) < 3) next
+    
+    # Create three climate models
+    spei.model <-  gdd.model <- precip.model <- NULL
+    AIC.SPEI <- AIC.GDD <- AIC.precip <- 999999999
+      
+    # SPEI model - only run if there are 5 data points
+    
+    if (length(!is.na(SPEI.covariates$z.SPEI)) < 3) {
+      spei.model <- anova(gls(Live_Weight ~ 0 + Volume*z.SPEI,
+                              data=SpSe.sub,
+                              na.action = na.exclude),
+                          type="marginal") 
+      AIC.SPEI <- AIC(gls(Live_Weight ~ 0 + Volume*z.SPEI,
+                        data=SpSe.sub, na.action = na.exclude)) }
+    
+    # GDD model - only run if there are 5 data points
+    if (length(!is.na(GDD.covariates$z.GDD)) < 3) {
+      gdd.model <- anova(gls(Live_Weight ~ 0 + Volume*z.GDD,
+                              data=SpSe.sub,
+                              na.action = na.exclude),
+                          type="marginal") 
+      AIC.GDD <- AIC(gls(Live_Weight ~ 0 + Volume*z.GDD,
+                       data=SpSe.sub, na.action = na.exclude)) }
+
+    # precip model - only run if there are 5 data points
+    if (length(!is.na(precip.covariates$z.precip)) < 3) {
+        precip.model <- anova(gls(Live_Weight ~ 0 + Volume*z.precip,
+                              data=SpSe.sub,
+                              na.action = na.exclude),
+                          type="marginal") 
+        AIC.precip <- AIC(gls(Live_Weight ~ 0 + Volume*z.precip,
+                          data=SpSe.sub, na.action = na.exclude)) }
+
+    # Calculate all possible regression slopes
+    # SPEI
+    SPEI.slopes <- NA; z.SPEIs <- NA
+    for (clim in 1:length(unique(SpSe.sub$z.SPEI))) {
+      if (is.na(unique(SpSe.sub$z.SPEI)[clim]) |
+          length(SpSe.sub[SpSe.sub$z.SPEI == unique(SpSe.sub$z.SPEI)[clim],]) < 2) 
+        next
+      next.slope <- lm(Live_Weight ~ 0 + Volume,
+        data=SpSe.sub[SpSe.sub$z.SPEI == unique(SpSe.sub$z.SPEI)[clim],])$coef
+      next.z.SPEI <- unique(SpSe.sub$z.SPEI)[clim]
+      if (all(is.na(SPEI.slopes))) {
+        SPEI.slopes <- next.slope
+        z.SPEIs <- next.z.SPEI } else {
+          SPEI.slopes <- c(SPEI.slopes, next.slope)
+          z.SPEIs <- c(z.SPEIs, next.z.SPEI)}}
+    all.SPEI.slopes <- data.frame("kartez" = unique(SpSe.sub$kartez),
+                                  "season" = unique(SpSe.sub$Season),
+                                  "z.score" = z.SPEIs, 
+                                  "reg.slope" = SPEI.slopes,
+                                  "variable" = "SPEI")
+    #plot(z.SPEIs, SPEI.slopes)
+    # GDD
+    GDD.slopes <- NA; z.GDDs <- NA
+    for (clim in 1:length(unique(SpSe.sub$z.GDD))) {
+      if (is.na(unique(SpSe.sub$z.GDD)[clim]) |
+          length(SpSe.sub[SpSe.sub$z.GDD == unique(SpSe.sub$z.GDD)[clim],]) < 2) 
+        next
+      next.slope <- lm(Live_Weight ~ 0 + Volume,
+        data=SpSe.sub[SpSe.sub$z.GDD == unique(SpSe.sub$z.GDD)[clim],])$coef
+      next.z.GDD <- unique(SpSe.sub$z.GDD)[clim]
+      if (all(is.na(GDD.slopes))) {
+        GDD.slopes <- next.slope
+        z.GDDs <- next.z.GDD } else {
+          GDD.slopes <- c(GDD.slopes, next.slope)
+          z.GDDs <- c(z.GDDs, next.z.GDD)}}
+    all.GDD.slopes <- data.frame("kartez" = unique(SpSe.sub$kartez),
+                                 "season" = unique(SpSe.sub$Season),
+                                 "z.score" = z.GDDs, 
+                                 "reg.slope" = GDD.slopes,
+                                 "variable" = "GDD")
+    #plot(z.GDDs, GDD.slopes)
+    # Precip
+    precip.slopes <- NA; z.precips <- NA
+    for (clim in 1:length(unique(SpSe.sub$z.precip))) {
+      if (is.na(unique(SpSe.sub$z.GDD)[clim]) |
+          length(SpSe.sub[SpSe.sub$z.GDD == unique(SpSe.sub$z.GDD)[clim],]) < 2) 
+        next
+      next.slope <- lm(Live_Weight ~ 0 + Volume,
+        data=SpSe.sub[SpSe.sub$z.precip == unique(SpSe.sub$z.precip)[clim],])$coef
+      next.z.precip <- unique(SpSe.sub$z.precip)[clim]
+      if (all(is.na(precip.slopes))) {
+        precip.slopes <- next.slope
+        z.precips <- next.z.precip } else {
+          precip.slopes <- c(precip.slopes, next.slope)
+          z.precips <- c(z.precips, next.z.precip)}}
+    all.precip.slopes <- data.frame("kartez" = unique(SpSe.sub$kartez),
+                                    "season" = unique(SpSe.sub$Season),
+                                    "z.score" = z.precips, 
+                                    "reg.slope" = precip.slopes,
+                                    "variable" = "precip")
+    #plot(z.precips, precip.slopes)
+    
+    these.slopes <- rbind(all.SPEI.slopes, all.GDD.slopes, all.precip.slopes)
+    
+    if (all(is.na(all.slopes))) {
+        all.slopes <- these.slopes } else {
+          all.slopes <- rbind(all.slopes, these.slopes) }
+    
+    # Raw data plots
+    SPEI.fig <- ggplot(data = SpSe.sub, aes(x = Volume, y = Live_Weight,
+                                            colour = z.SPEI)) +
+      theme_cowplot(font_size = 10) + theme(legend.position = "top") + 
+      guides(colour = guide_colorbar(title.position = "top")) +
+      ylim(0,max(SpSe.sub$Live_Weight, na.rm=T)) +
+      xlab('Volume') + ylab('Live_Weight') + 
+      geom_point(alpha=0.8)
+    
+    GDD.fig <- ggplot(data = SpSe.sub, aes(x = Volume, y = Live_Weight, 
+                                         colour = z.GDD)) +
+      theme_cowplot(font_size = 10) + 
+      theme(axis.text.y = element_blank(), axis.title.y = element_blank(),
+            legend.position = "top") + 
+      guides(colour = guide_colorbar(title.position = "top")) +
+      ylim(0,max(SpSe.sub$Live_Weight, na.rm=T)) +
+      xlab('Volume') + ylab('Live_Weight') + 
+      geom_point(alpha=0.8)
+    
+    precip.fig <- ggplot(data = SpSe.sub, aes(x = Volume, y = Live_Weight, 
+                                              colour = z.precip)) +
+      theme_cowplot(font_size = 10) + 
+      theme(axis.text.y = element_blank(), axis.title.y = element_blank(),
+            legend.position = "top") + 
+      guides(colour = guide_colorbar(title.position = "top")) +
+      ylim(0,max(SpSe.sub$Live_Weight, na.rm=T)) +    
+      xlab('Volume') + ylab('Live_Weight') + 
+      geom_point(alpha=0.8)
+    
+    # Print
+    #cat("  \n\n All raw data \n\n")
+    print(plot_grid(SPEI.fig, GDD.fig, precip.fig, align = 'h', nrow=1, rel_widths = c(1.3,1,1)))
+    
+    # Create concise table of significant interactions within full model
+    model.comparison <- 
+      data.frame(
+        Vol.SPEI_p = spei.model["Volume:z.SPEI", "p-value"], 
+        Vol.GDD_p = gdd.model["Volume:z.GDD", "p-value"], 
+        Vol.precip_p = precip.model["Volume:z.precip", "p-value"],
+        Vol.SPEI_AICc = AIC.SPEI - min(c(AIC.SPEI, AIC.GDD, AIC.precip)), 
+        Vol.GDD_AICc = AIC.GDD - min(c(AIC.SPEI, AIC.GDD, AIC.precip)), 
+        Vol.precip_AICc = AIC.precip - min(c(AIC.SPEI, AIC.GDD, AIC.precip)))
+    
+    if (AIC.SPEI == 999999999) {model.comparison$Vol.SPEI_AICc <- NA}
+    if (AIC.GDD == 999999999) {model.comparison$Vol.GDD_AICc <- NA}
+    if (AIC.precip == 999999999) {model.comparison$Vol.precip_AICc <- NA}
+    
+    # Print visreg plot for best model
+    if (!is.na(model.comparison$Vol.SPEI_AICc) & 
+        model.comparison$Vol.SPEI_AICc <= 2) {
+      SPEI.interaction <- visreg2d(lm(Live_Weight ~ 0 + Volume*z.SPEI, data=SpSe.sub), xvar="Volume", yvar="z.SPEI", type="conditional") }
+    
+    if (!is.na(model.comparison$Vol.GDD_AICc) & 
+        model.comparison$Vol.GDD_AICc <= 2) {
+      GDD.interaction <- visreg2d(lm(Live_Weight ~ 0 + Volume*z.GDD, data=SpSe.sub), xvar="Volume", yvar="z.GDD", type="conditional") }
+    
+    if (!is.na(model.comparison$Vol.precip_AICc) & 
+        model.comparison$Vol.precip_AICc <= 2) {
+      precip.interaction <- visreg2d(lm(Live_Weight ~ 0 + Volume*z.precip, data=SpSe.sub), xvar="Volume", yvar="z.precip", type="conditional")  } 
+    
+    # Print model comparison table
+    cat("  \n\n")
+    print(kable(model.comparison, format="pandoc"))
+    cat("  \n\n")
+
+
+    # Merge output from this species onto all-species output matrix
+#    model.coefs.all <- merge(model.coefs.all, model.coefs.sp, all=T)
+#    model.coefs.all <- model.coefs.all[!is.na(model.coefs.all$kartez),]
+    
+  }
+}
+
+#write.csv(model.coefs.all, "~/Desktop/SevPlantBiomass_29Aug17.csv")
+write.csv(all.slopes, "~/Desktop/SevPlantBiomass_ClimateSlopes_22Sept17.csv")
+```
+

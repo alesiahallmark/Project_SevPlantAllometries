@@ -1,0 +1,244 @@
+---
+title: "SEV_NPP_initialQAQC"
+author: "AJ"
+date: "10/26/2017"
+output: html_document
+---
+
+## Sevilleta NPP quality control
+
+This script reads in raw excel files from NPP quad observations in the field and outputs one filled, merged, and amended file, as well as a report on possible errors within that file.  
+In addition to the raw observation files, it utilizes a file of all previous NPP observations made at the Sevilleta.  
+
+### Initial Steps
+
+*Before going any further*: You must change the file directories within the "read in raw data" code chunk before this script can run!
+
+```{r}
+### Directory information
+# Where are the raw (or copies of the raw) data files stored?
+location_raw.data.sheets <- "~/Desktop/test_field_crew_data/"
+
+# Where is the large, all-quad data file stored?
+all.quad.file <- "/Users/alesia/Documents/Project_SevPublicPlantRCode/NPP_quad_met2016.csv"
+
+# Where is the master species list stored?
+master.species.list.file <- "~/Documents/Project_SevPublicPlantRCode/SevilletaSpeciesList_AJH.csv"
+```
+
+```{r load libraries, message=F, warning=F}
+# Load R packages that will be used
+# This list is long because Alesia is lazy 
+library(ggplot2)
+library(lubridate)
+library(plyr)
+library(reshape2)
+library(gridExtra)
+library(cowplot)
+library(knitr)
+library(markdown)
+library(xtable)
+library(tidyr)
+library(gdata)
+```
+
+
+```{r read in raw files}
+## Read in raw data files
+# For now, this script just runs on a few test files
+raw.data.sheets <- paste0(location_raw.data.sheets,
+      list.files(location_raw.data.sheets, pattern = "npp"))
+for (i in 1:length(raw.data.sheets)) {
+  raw.data.file <- read.xls(raw.data.sheets[i], na.strings=c(""))
+  # extract file name info
+  field.file.name <- strsplit(list.files(location_raw.data.sheets, pattern = "npp")[i], split = "[.]")[[1]]
+  raw.data.file$collection.date <- as.Date(paste(field.file.name[2], field.file.name[3], substr(field.file.name[4], start=nchar(field.file.name[4])-1, stop=nchar(field.file.name[4]))), format = "%m %d %y")
+  raw.data.file$collector <- as.factor(field.file.name[5])
+  if (i == 1) raw.data <- raw.data.file
+  else raw.data <- rbind(raw.data, raw.data.file)
+}
+
+colnames(raw.data) <- c("site", "treatment", "quad", "kartez", "obs", "cover", "height", "count", "comments", "collection.date", "collector")
+
+# Capitalize site and species names
+raw.data$site <- as.factor(toupper(raw.data$site))
+raw.data$kartez <- as.factor(toupper(raw.data$kartez))
+raw.data$treatment <- as.factor(toupper(raw.data$treatment))
+
+```
+
+```{r}
+# Read in all-quad data file
+all.quads <- read.csv(all.quad.file, strip.white = T)
+
+# reshape data.frame to long format
+#colnames(all.quads)
+all.quads <- gather(all.quads, key = kartez, value = NPP, 21:242)
+all.quads <- all.quads[all.quads$NPP > 0,]
+
+# reduce to columns of interest
+all.quads <- all.quads[,c("year", "site", "treat", "season", "web", "plot", "subplot", "quad_ID", "quad", "biome", "annual", "GDD", "SPEI12", "kartez", "NPP")]
+colnames(all.quads)[3] <- "treatment"
+
+# Possibly, read in a species list file
+master.species.list <- read.csv(master.species.list.file, strip.white = T)
+```
+
+In the field, data collectors don't manually fill in every row in the Excel file, because this is a waste of time. This loop reads through each row of the data file and, if cells within the site, plot, or quad columns are empty, fills that cell with information from the previous cell.  
+
+```{r fill in blank rows}
+# Fill in blank site, plot, and quad cells
+for (i in 1:nrow(raw.data)) {
+  if (is.na(raw.data$site[i])) raw.data$site[i] <- raw.data$site[i-1]
+  if (is.na(raw.data$treatment[i])) raw.data$treatment[i] <- raw.data$treatment[i-1]
+  if (is.na(raw.data$quad[i])) raw.data$quad[i] <- raw.data$quad[i-1]
+  if (is.na(raw.data$kartez[i])) raw.data$kartez[i] <- raw.data$kartez[i-1]
+}
+  
+```
+
+There are some "errors" that can be fixed easily and without any special consideration. These include:  
+
+```{r quick fixes}
+
+```
+
+Now let's read out this new data file. 
+# still an error: date formats
+
+```{r}
+# Read out data file
+write.out.file <- paste0(location_raw.data.sheets, "filled_raw_data", months(mean(raw.data$collection.date), abb=T), year(mean(raw.data$collection.date)))
+write.csv(raw.data, write.out.file, quote = F, row.names = F)
+
+filled.data <- read.csv(write.out.file, strip.white = T)
+filled.data$collection.date <- as.Date(filled.data$collection.date)
+```
+
+
+### Error report
+
+Now we can search for real errors. These errors are not fixed within this script, but simply reported. They should be evaluated by hand and corrected in the raw data or the new file, if necessary.
+The first type of error to consider are possible typos. This code chunk will output a list of possible typos in the site, species, cover, and OTHER columns, by checking these values against a list of "legal" values that we provide.   
+-remember to check list of possible "quad codes"    
+
+
+```{r find typos, echo = F, results="asis"}
+# Calculate total cover values per quad per species
+quad.totals <- ddply(filled.data, c("site", "treatment", "quad", "kartez"), function(x) data.frame(
+  sum.cover = sum(x$cover * x$count, na.rm=T), 
+  mean.cover = mean(x$cover, na.rm=T),
+  mean.height = mean(x$height, na.rm=T),
+  collector = unique(x$collector)))
+
+# Inconsistent collection dates
+cat("  \n\n Inconsistent collection dates:")
+errors <- unique(filled.data[is.na(filled.data$collection.date) |(filled.data$collection.date - mean(filled.data$collection.date)) > days(60), c("site", "collection.date", "collector")])
+{if (nrow(errors) > 0) kable(errors)
+else cat("  \n no errors found \n")}
+
+# Rows with missing data
+cat("  \n Rows with missing data: \n")
+errors <- unique(filled.data[is.na(filled.data$site) |
+                           is.na(filled.data$treatment) |
+                           is.na(filled.data$quad) |
+                           is.na(filled.data$kartez) |
+                           is.na(filled.data$cover) |
+                           is.na(filled.data$height) |
+                             is.na(filled.data$count),
+                           c("site", "quad", "kartez", "cover", "height", "count", "collection.date", "collector")])
+{if (nrow(errors) > 0) kable(errors)
+else cat("  \n no errors found \n")}
+
+# Site names in the filled.data file that don't exist in the all.quads data file
+cat("  \n Site names in the filled.data file that don't exist in the all.quads data file: \n")
+errors <- unique(filled.data[!filled.data$site %in% c(all.quads$site), c("site", "collection.date", "collector")])
+{if (nrow(errors) > 0) kable(errors)
+else cat("  \n no errors found \n")}
+
+# Site-treatment combinations in the filled.data file that don't exist in the all.quads data file
+cat("  \n Site-treatment combinations in the filled.data file that don't exist in the all.quads data file: \n")
+errors <- unique(filled.data[!paste(filled.data$site, filled.data$treatment) %in% paste(all.quads$site, all.quads$treatment), c("site", "treatment", "collection.date", "collector")])
+{if (nrow(errors) > 0) kable(errors)
+else cat("  \n no errors found \n")}
+
+# Site-quad combinations in the filled.data file that don't exist in the all.quads data file
+cat("  \n Site-quad combinations in the filled.data file that don't exist in the all.quads data file: \n")
+errors <- unique(filled.data[!paste(filled.data$site, filled.data$quad) %in% paste(all.quads$site, all.quads$quad), c("site", "quad", "collection.date", "collector")]) 
+{if (nrow(errors) > 0) kable(errors)
+else cat("  \n no errors found \n")}
+
+# Missing site-quad combinations in the filled.data file that DO exist in the all.quads data file
+### Note: This seems to print a lot of junk. Might want to give more specific list
+cat("  \n Site-quad combinations in the filled.data file that don't exist in the all.quads data file: \n")
+errors <- unique(all.quads[!paste(all.quads$site, all.quads$quad) %in% paste(filled.data$site, filled.data$quad), c("site", "treatment", "web", "plot", "quad")]) 
+{if (nrow(errors) > 0) kable(errors)
+  else cat("  \n no errors found \n")}
+
+# Species names in the filled.data file that don't exist in the all.quads data file
+cat("  \n Species names in the filled.data file that don't exist in the all.quads data file: \n")
+errors <- unique(filled.data[!filled.data$kartez %in% all.quads$kartez, c("site", "kartez", "collection.date", "collector")])
+{if (nrow(errors) > 0) kable(errors)
+else cat("  \n no errors found \n")}
+
+# Species names in the filled.data file that don't exist in the species file
+cat("  \n Species names in the filled.data file that don't exist in the species file: \n")
+errors <- unique(filled.data[!filled.data$kartez %in% master.species.list$kartez, c("site", "kartez", "collection.date", "collector")])
+{if (nrow(errors) > 0) kable(errors)
+else cat("  \n no errors found \n")}
+
+# Cover values that are not in the allowed intervals
+cat("  \n Cover values that are not in the allowed intervals: \n")
+errors <- unique(filled.data[
+  filled.data$cover > 30 |
+    (filled.data$cover < 1 & !filled.data$cover %in% c(0.01, 0.05, 0.1, 0.25, 0.5, 0.75)),
+  c("site", "kartez", "cover", "height", "collection.date", "collector")])
+{if (nrow(errors) > 0) kable(errors)
+else cat("  \n no errors found \n")}
+
+# Count values that are not integers
+cat("  \n Count values that are not integers: \n")
+errors <- unique(filled.data[
+  is.na(filled.data$count) | 
+    filled.data$count < 1 |
+    (filled.data$count %% 1) != 0,
+  c("site", "kartez", "cover", "height", "count", "collection.date", "collector")])
+{if (nrow(errors) > 0) kable(errors)
+  else cat("  \n no errors found \n")}
+
+# Cover values that add up to too much per quad
+cat("  \n Cover values that add up to too much per quad: \n")
+errors <- unique(quad.totals[quad.totals$sum.cover > 100, c("site", "treatment")])
+{if (nrow(errors) > 0) kable(errors)
+else cat("  \n no errors found \n")}
+```
+
+Next, we can search for entries that are technically legal, but outside the bounds of observations commonly made. 
+Highly improbable:
+- species never before seen at that site
+- species cover or height outside of 3 s.d. seen at that site-season
+- individual measurements add up to a number very different from previous year
+
+Slightly improbable:
+- species rare and never before seen at that plot or wheel
+- species outside of 1.5 s.d. seen at that site-season
+- individual measurements add up to a number slightly different that previous year, but within range of possibility
+
+```{r find possible errors}
+
+```
+
+### Data trends
+
+Now we can output some general trends.
+- species that increased/decreased in cover compared to previous years
+- species that increased/decreased in height compared to previous years
+- plots or webs that increased/decreased in total plant biomass
+- plots or webs that increased/decreased in total species diversity
+- compare observers  
+-- average height and cover per species
+-- species diversity noted (maybe a Shannon diversity value as well as a community composition figure)
+-- rank abundance curves
+
+
+

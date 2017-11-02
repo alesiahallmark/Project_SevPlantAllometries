@@ -1,0 +1,14 @@
+"0","# Read in all-quad data file"
+"0","all.quads <- read.csv(all.quad.file, strip.white = T)"
+"0","# reshape data.frame to long format"
+"0","#colnames(all.quads)"
+"0","all.quads <- gather(all.quads, key = kartez, value = NPP, 21:242)"
+"0","all.quads <- all.quads[all.quads$NPP > 0,]"
+"0","# reduce to columns of interest"
+"0","all.quads <- all.quads[,c(""year"", ""site"", ""treat"", ""season"", ""web"", ""plot"", ""subplot"", ""quad_ID"", ""quad"", ""biome"", ""annual"", ""GDD"", ""SPEI12"", ""kartez"", ""NPP"")]"
+"0","colnames(all.quads)[3] <- ""treatment"""
+"0","# Possibly, read in a species list file"
+"0","master.species.list <- read.csv(master.species.list.file, strip.white = T)"
+"2","Error in read.table(file = file, header = header, sep = sep, quote = quote,  : 
+  no lines available in input
+"

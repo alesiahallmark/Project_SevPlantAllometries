@@ -1,0 +1,260 @@
+---
+title: "SEV_PlantBiomassRegressions_BurnEffects"
+author: "AJ"
+date: '`r Sys.time()`'
+output: html_document
+---
+
+##Background
+Several long-term studies at the Sevilleta LTER measure net primary production (NPP) across ecosystems and treatments. Net primary production is a fundamental ecological variable that quantifies rates of carbon consumption and fixation. Estimates of NPP are important in understanding energy flow at a community level as well as spatial and temporal responses to a range of ecological processes. Above-ground net primary production (ANPP) is the change in plant biomass, including loss to death and decomposition, over a given period of time. To measure this change, vegetation variables, including species composition and the cover and height of individuals, are sampled up to three times yearly (winter, spring, and fall) at permanent plots within a study site. Sevilleta LTER dataset 157 includes cover, height, and dry biomass measurements obtained through destructive harvesting. These species are always harvested from habitat comparable to the plots in which they were recorded.
+
+##Purpose
+The following R code utilizes volume (cover x height) and weight data from Sev dataset 157 to create regressions which can be used to estimate seasonal biomass for plant species across the Sevilleta.
+
+This script specifically tests for species-specific burn effects on volume:mass relationships or allometries. As such, we will only be looking at species collected at Site L (Deep Well area) collections which were initiated in 2004.
+
+```{r load.packages, include=FALSE}
+# Load R packages which will be used in this script
+library(ggplot2)
+library(lubridate)
+library(plyr)
+library(reshape2)
+library(gridExtra)
+library(cowplot)
+library(knitr)
+library(markdown)
+library(xtable)
+library(zoo)
+library(tidyr)
+library(stats)
+library(car)
+library(nlme)
+library(visreg)
+```
+
+### Step 1: Preparing the data
+SEV dataset 157 (version 20161218) is used here.
+
+```{r, include = F}
+# Read in SEV 157 data
+dest.harv.raw <- read.csv("/Users/alesia/Documents/Project_SevPublicPlantRCode/sev157_nppweight_20161218.csv", strip.white=T)
+
+```
+
+```{r include = F}
+# Look at SEV 157 data
+summary(dest.harv.raw)
+
+# Modify column names
+names(dest.harv.raw)[names(dest.harv.raw) == "Species"] <- "kartez"
+
+# Select collections from Site L
+dest.harv <- dest.harv.raw[dest.harv.raw$Site == "L",1:11]
+
+# Convert error data to NA's
+dest.harv$Treatment[dest.harv$Treatment == ""] <- NA
+dest.harv$Observation[dest.harv$Observation < 1] <- NA
+dest.harv$Count[is.na(dest.harv$Count)] <- 0
+dest.harv$Cover[dest.harv$Cover < 0.01 | dest.harv$Cover > 100] <- NA
+dest.harv$Height[dest.harv$Height < 1] <- NA
+dest.harv$Live_Weight[dest.harv$Live_Weight < 0.01] <- NA
+dest.harv$Live_Weight[dest.harv$Live_Weight < 0] <- NA
+
+# Calculate volume
+dest.harv$Volume <- dest.harv$Cover * dest.harv$Height
+
+# Duplicate rows with Counts greater than 1
+dest.harv.extend <- dest.harv[rep(row.names(dest.harv), dest.harv$Count), c("Year", "Season", "Date", "Site", "Treatment", "kartez", "Cover", "Height", "Live_Weight", "Volume")]
+
+# Arrange by species name in alphabetical order
+dest.harv.extend <- dest.harv.extend[with(dest.harv.extend, order(kartez, Year, Season)),]
+
+# Check for species typos
+#unique(dest.harv.extend$kartez)
+
+
+# Burn treatment effects more useful if coded as "years since burn"
+#summary(as.factor(dest.harv.extend$Year[dest.harv.extend$Treatment == "B"]))
+# Assume that all sites were burned in 1980
+dest.harv.extend$SinceBurn <-
+  dest.harv.extend$Year - 1980
+# Assume that all of McKenzie Flats was burned in 1980
+#dest.harv.extend$SinceBurn[dest.harv.extend$Site == "L"] <-
+#  dest.harv.extend$Year[dest.harv.extend$Site == "L"] - 1980
+# After 2009 fire, "Control" collections came from area burned in 2003
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "C" & 
+                             dest.harv.extend$Year > 2009] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "C" &
+                          dest.harv.extend$Year > 2009] - 2003
+# Before 2009 fire, "Burn" collections came from area burned in 2003
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Year < 2010] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "B" &
+                          dest.harv.extend$Year < 2010] - 2003
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Date == "10/20/2009"] <- 0
+# After 2009 fire, "Burn" collections came from area burned in 2009
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Year > 2009] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "B" &
+                          dest.harv.extend$Year > 2009] - 2009
+
+#unique(dest.harv.extend[, c("Year", "SinceBurn", "Treatment")])
+
+```
+
+The data look like this:
+
+```{r, echo=F}
+# The data look like this
+kable(head((dest.harv.extend), format="pandoc"))
+```
+
+```{r}
+# Create full matrix for model output
+model.coefs.all <- data.frame(
+  kartez = as.factor(NA), 
+  Year = as.factor(NA),
+  Season = as.factor(NA),
+  Treatment = as.factor(NA),
+  Beta.Volume = NA,
+  SE = NA,
+  p.value = NA,
+  AdjR = NA)
+```
+
+We will consider the following species:
+
+```{r, echo=F, results="asis", fig.height=3.5, fig.width=3.5, warning=F}
+# Loop through all species
+for (species in 1:length(unique(dest.harv.extend$kartez))) {
+#for (species in 18:25) {
+  # Create subset dataframe for that species
+  sp.sub <- unique(dest.harv.extend[dest.harv.extend$kartez ==
+                                      unique(dest.harv.extend$kartez)[species] &
+                                      !is.na(dest.harv.extend$Volume) &
+                                      !is.na(dest.harv.extend$Live_Weight),])
+  
+  # Create list of covariates possible for this species
+  #cov.sub
+  all.covariates <- unique(sp.sub[,c("Year", "Season", "SinceBurn")])
+  season.cov <- unique(sp.sub[,c("Year", "Season")])
+  trt.cov <- unique(sp.sub[,c("Year", "SinceBurn")])
+
+  # Print summary of species' destructive harvest data
+  # IF they display significant burn effects
+      # require there to be multiple burn samples in the past 10 years
+    if (length(unique(trt.cov$SinceBurn[trt.cov$SinceBurn < 11])) < 2 |
+        # require at least unique burn years within the same year
+        length(unique(trt.cov$Year[trt.cov$SinceBurn < 11])) == 
+        length(trt.cov$Year[trt.cov$SinceBurn < 11])) next
+    if (is.na(anova(gls(Live_Weight ~ 0 + Volume*SinceBurn, data=sp.sub, na.action = na.exclude, control=list(singular.ok=T)))["Volume:SinceBurn", "p-value"])) next
+  # If there are fewer than 20 samples, discontinue analysis and skip to next species
+  if (length(!is.na(sp.sub$Live_Weight)) < 12) next
+
+  # Species:
+  cat("  \n\n### Species:", as.character(unique(sp.sub$kartez)))
+  # Number of observations: 
+  cat("  \n Number of observations:", length(sp.sub$Live_Weight))
+  # Years collected: 
+  cat("  \n Years collected:", min(sp.sub$Year, na.rm=T), " - ", max(sp.sub$Year, na.rm=T))
+  # Burn treatments considered
+  cat("  \n Burn treatments considered:", min(sp.sub$SinceBurn, na.rm=T), " - ", max(sp.sub$SinceBurn, na.rm=T))
+  # Size range:   
+  cat("  \n *Size range*: \n")  
+  cat("  \n - Cover:", min(sp.sub$Cover, na.rm=T), " - ", max(sp.sub$Cover, na.rm=T)) 
+  cat("  \n - Height:", min(sp.sub$Height, na.rm=T), " - ", max(sp.sub$Height, na.rm=T))  
+  cat("  \n - Volume:", min(sp.sub$Volume, na.rm=T), " - ", max(sp.sub$Volume, na.rm=T))  
+  cat("  \n - Weight:", min(sp.sub$Live_Weight, na.rm=T), " - ", max(sp.sub$Live_Weight, na.rm=T), "  \n")
+  
+  # Format Season and Year columns
+  sp.sub$Season <- as.factor(sp.sub$Season)
+  sp.sub$Year <- as.factor(sp.sub$Year)
+  # Determine p-values for interaction effects in "full model"
+  # Here we will consider Year, Season, and Treatment
+
+  # Construct full.model formula
+  # Exclude covariates with limited (singular) data, as these will break gls()
+  full.model.string <- paste0("Live_Weight ~ 0 + Volume",
+    # require each season to have been sampled twice
+    if (length(season.cov$Season[season.cov$Season=="1"]) > 1 &
+        length(season.cov$Season[season.cov$Season=="2"]) > 1 &
+        length(season.cov$Season[season.cov$Season=="3"]) > 1){
+      # require a significant Volume:Season interaction
+      if (!is.na(anova(gls(Live_Weight ~ 0 + Volume*Season, data=sp.sub, na.action = na.exclude, control=list(singular.ok=T)))["Volume:Season", "p-value"]))
+        {" + Season"}},
+    # require there to be multiple burn samples in the past 10 years
+    if (length(unique(trt.cov$SinceBurn[trt.cov$SinceBurn < 11])) > 1 &
+        # require at least unique burn years within the same year
+        length(unique(trt.cov$Year[trt.cov$SinceBurn < 11])) != 
+        length(trt.cov$Year[trt.cov$SinceBurn < 11])){
+      if (!is.na(anova(gls(Live_Weight ~ 0 + Volume*SinceBurn, data=sp.sub, na.action = na.exclude, control=list(singular.ok=T)))["Volume:SinceBurn", "p-value"]))
+        {" + Volume*SinceBurn"}})
+  
+  # Create model with all significant interaction terms
+  full.model <- anova(gls(as.formula(full.model.string),
+                          data=sp.sub,
+                          na.action = na.exclude),
+                      type="marginal")
+  
+  # Create concise table of significant interactions within full model
+  full.output <- data.frame(kartez = unique(sp.sub$kartez),
+                            Vol.Season_p = NA, Vol.Trt_p = NA)
+  
+  full.output[,c("Vol.Season_p", "Vol.Trt_p")] <-
+    full.model[c("Season", "Volume:SinceBurn"), "p-value"]
+  
+  # Print full model
+  cat("  \n\n Model:", gsub(full.model.string, pattern="*", rep=" x ", fixed=T), "  \n")
+  cat("  \n - Volume main effect:", full.model["Volume", "p-value"])
+  cat("  \n - Season main effect:", full.output$Vol.Season_p)
+  cat("  \n - Volume x Treatment interaction:", full.output$Vol.Trt_p, "  \n")
+  
+  # Plot full model
+
+  # Residual plots
+  cat("  \n\n Model residuals. Variables with non-significant interactions not shown. \n\n")
+  if (!is.na(full.output$Vol.Season_p) & full.output$Vol.Season_p < 0.05) {
+    visreg(lm(full.model.string, data=sp.sub), xvar="Volume", by="Season")}
+  
+  if (!is.na(full.output$Vol.Trt_p) & full.output$Vol.Trt_p < 0.05) {
+      visreg2d(lm(full.model.string, data=sp.sub), xvar="Volume", yvar="SinceBurn")}
+  
+  # Loop through models for each combination of Year, Site, Season, and Treatment (depending on which factors had significant interaction terms in the full model)
+  model.coefs.sp <-
+    unique(sp.sub[!is.na(sp.sub$Live_Weight) & !is.na(sp.sub$Volume),
+                  c("kartez", "Season", "SinceBurn")])
+  
+  # Select only columns for terms that were significant in model
+  if (is.na(full.output$Vol.Season_p) | full.output$Vol.Season_p > 0.05) 
+    {model.coefs.sp$Season <- NULL}
+  if (is.na(full.output$Vol.Trt_p) | full.output$Vol.Trt_p > 0.05)
+    {model.coefs.sp$Treatment <- NULL}
+  
+  model.coefs.sp <- unique(model.coefs.sp)
+  sig.factors <- names(model.coefs.sp)
+  
+  # Create linear model for each line in data.frame
+  # Extract beta, SE, and Adjust R-squared from model
+  model.coefs.sp[,c("Beta.Volume", "SE", "p.value", "AdjR")] <- NA
+  
+  for (i in 1:length(model.coefs.sp[,1])) {
+    model.coefs.sp[i, c("Beta.Volume", "SE", "p.value")] <- summary(lm(
+      Live_Weight ~ 0 + Volume,
+      data=sp.sub[interaction(sp.sub[,sig.factors]) %in%
+                    interaction(model.coefs.sp[i,sig.factors]),]))$coefficients[c(1,2,4)]
+    model.coefs.sp[i, c("AdjR")] <- summary(lm(
+      Live_Weight ~ 0 + Volume,
+      data=sp.sub[interaction(sp.sub[,sig.factors]) %in%
+                    interaction(model.coefs.sp[i,sig.factors]),]))$adj.r.squared
+    }
+  
+  # Merge output from this species onto all-species output matrix
+  model.coefs.all <- merge(model.coefs.all, model.coefs.sp, all=T)
+  model.coefs.all <- model.coefs.all[!is.na(model.coefs.all$kartez),]
+}
+
+write.csv(model.coefs.all, "~/Desktop/SevPlantBiomassBurnEffects_7Sept17.csv")
+
+```
+

@@ -1,0 +1,497 @@
+---
+title: "SEV_PlantBiomassRegressions_RoundOne"
+author: "AJ"
+date: '`r Sys.time()`'
+output: html_document
+---
+
+##Background
+Several long-term studies at the Sevilleta LTER measure net primary production (NPP) across ecosystems and treatments. Net primary production is a fundamental ecological variable that quantifies rates of carbon consumption and fixation. Estimates of NPP are important in understanding energy flow at a community level as well as spatial and temporal responses to a range of ecological processes. Above-ground net primary production (ANPP) is the change in plant biomass, including loss to death and decomposition, over a given period of time. To measure this change, vegetation variables, including species composition and the cover and height of individuals, are sampled up to three times yearly (winter, spring, and fall) at permanent plots within a study site. Sevilleta LTER dataset 157 includes cover, height, and dry biomass measurements obtained through destructive harvesting. These species are always harvested from habitat comparable to the plots in which they were recorded.
+
+#### Required input files
+The following R code requires three source files:  
+- Sev dataset 157, which includes volume (cover x height) and weight data from destructively harvested individuals. This is used to create regressions which can be used to estimate seasonal biomass for plant species across the Sevilleta.  
+- All available per-quad observations of plant volume and height from across the Sevilleta to characterize the range of plant sizes to which we are applying biomass regressions. (file from email sent from J Rudgers 12 Sept 2017)  
+- A file with species names tied to additional taxonomic and life history trait info (Alesia's personal species list used here)
+
+### Products
+This script itself is a product. The code should be transparent and easily reproducible. 
+
+This script, when knit, creates a PDF report for every species in the Sev 157 or "all quad" data files. Demographic data, number of observations, and descriptions of linear models will be listed for each species, along with figures which visually describe model interactions. 
+Predictor variables  include:  
+-individual plant volume (height*cover)
+-site at which plant occurs
+-season during which plant was observed
+-treatment (burned in the past 5 years or "unburned")
+-year during which destructive harvest sample was collected  
+
+A .csv file is created that includes linear model slopes and p-values for each pairwise comparison of the above the terms. 
+
+A list of high-priority species to destructively harvest will also be created. This list will include a reason for suggested harvest and size classes for which we desire samples.
+
+```{r load.packages, include=FALSE}
+# Load R packages which will be used in this script
+library(ggplot2)
+library(lubridate)
+library(plyr)
+library(reshape2)
+library(gridExtra)
+library(cowplot)
+library(knitr)
+library(markdown)
+library(xtable)
+library(zoo)
+library(tidyr)
+library(stats)
+library(car)
+library(nlme)
+library(visreg)
+```
+
+### Step 1: Preparing the data
+SEV dataset 157 (version 20161218) is used here.
+```{r, include=F}
+# Read in SEV 157 and format columns
+dest.harv.raw <- read.csv("/Users/alesia/Documents/Project_SevPublicPlantRCode/sev157_nppweight_20161218.csv", strip.white=T)
+
+# Look at the data
+summary(dest.harv.raw)
+
+# Modify column names
+names(dest.harv.raw)[names(dest.harv.raw) == "Species"] <- "kartez"
+
+# Convert error data to NA's
+dest.harv <- dest.harv.raw[,1:14]
+dest.harv$Treatment[dest.harv$Treatment == ""] <- NA
+dest.harv$Observation[dest.harv$Observation < 1] <- NA
+dest.harv$Count[is.na(dest.harv$Count)] <- 0
+dest.harv$Cover[dest.harv$Cover < 0.01 | dest.harv$Cover > 100] <- NA
+dest.harv$Height[dest.harv$Height < 1] <- NA
+dest.harv$Live_Weight[dest.harv$Live_Weight < 0.01] <- NA
+dest.harv$Live_Weight[dest.harv$Live_Weight < 0] <- NA
+
+# Calculate volume
+dest.harv$Volume <- dest.harv$Cover * dest.harv$Height
+
+# Duplicate rows with Counts greater than 1
+dest.harv.extend <- dest.harv[rep(row.names(dest.harv), dest.harv$Count), c("Year", "Season", "Date", "Site", "Treatment", "kartez", "Cover", "Height", "Live_Weight", "Volume")]
+
+# Make a SiteCluster column
+dest.harv.extend$SiteCluster <- revalue(dest.harv.extend$Site, c(
+  "C" = "L",
+  "G" = "L",
+  "CG" = "L",
+  "B" = "L",
+  "P" = "PJ",
+  "J" = "PJ"))
+
+# Arrange by species name in alphabetical order
+dest.harv.extend <- dest.harv.extend[with(dest.harv.extend, order(kartez, Year, Season)),]
+
+```
+
+The data look like this:
+
+```{r, echo=F}
+# The data look like this
+kable(head((dest.harv.extend), format="pandoc"))
+```
+
+```{r}
+# read in all Sev quad data
+allquadNPP <- read.csv("/Users/alesia/Documents/Project_SevPublicPlantRCode/NPP_quad_met2016.csv", strip.white = T)
+
+# reshape data.frame to long format
+colnames(allquadNPP)
+allquadNPP <- gather(allquadNPP, key = kartez, value = old.NPP, 21:242)
+allquadNPP <- allquadNPP[allquadNPP$old.NPP > 0,]
+
+# reduce to columns of interest
+allquadNPP <- allquadNPP[,c("year", "site", "treat", "season", "web", "plot", "subplot", "quad_ID", "quad", "biome", "annual", "GDD", "SPEI12", "kartez", "old.NPP")]
+
+#ggplot(allquadNPP[allquadNPP$kartez == unique(allquadNPP$kartez)[25] & allquadNPP$season == 3,], aes(x=log10(old.NPP), y=..count.., group=biome, fill=biome)) + geom_histogram() 
+
+```
+
+```{r}
+# Read in species' taxonomy data
+taxo <- read.csv("/Users/alesia/Documents/Project_SevPublicPlantRCode/SevilletaSpeciesList_AJH.csv", strip.white = T)
+
+# Revalue a_p and g_f columns
+taxo$a_p <- revalue(taxo$a_p, c(
+  "a" = "annual",
+  "p" = "perennial",
+  "a/p" = "annual/perennial"))
+taxo$g_f <- revalue(taxo$g_f, c(
+  "f" = "forb",
+  "t" = "tree", 
+  "g" = "grass",
+  "s" = "shrub"))
+
+# Merge taxonomy file onto other two datasets
+dest.harv.extend <- merge(dest.harv.extend, taxo[,c("kartez", "family", "genus", "species", "path", "a_p", "g_f")], by="kartez", all.x=T)
+allquadNPP <- merge(allquadNPP, taxo[,c("kartez", "family", "genus", "species", "path", "a_p", "g_f")], by="kartez", all.x=T)
+
+# Find species in the destructive harvest file that are not in the taxo file
+dest.sp.err <- unique(dest.harv.extend$kartez[!dest.harv.extend$kartez %in% taxo$kartez])
+
+# Exclude unknown species
+dest.harv.extend <- dest.harv.extend[!dest.harv.extend$kartez %in% c("FORB1", "UKFO10", "UKFO13", "UKFO17", "UKFO18", "UKFO75", "UKFO80", "UKSH5"),]
+
+# Exclude woody species. Need to be treated separately
+dest.harv.extend <- dest.harv.extend[!dest.harv.extend$kartez %in% c("LATR2F", "LATR2L", "LATR2T", "LATR2W", "QUTU2B", "YUBAC", "YUBAL"),]
+
+#dest.harv.extend[dest.harv.extend$kartez == "MUPA",]
+#allquadNPP[allquadNPP$kartez == "MUPA2",]
+
+# Correct typos
+dest.harv.extend$kartez <- revalue(dest.harv.extend$kartez, c(
+  "CHLA2" = "CHAL11", #guess based on cover/height/presence in other datasets
+  "CHST" = "CHST8", #these don't even have heights
+  "DIW12" = "DIWI2",
+  "MUPA" = "MUPA2",
+  "SPOR" = "SPORO"))
+
+# Update old species names
+dest.harv.extend$kartez <- revalue(dest.harv.extend$kartez, c(
+  "MOSQ" = "MUSQ3",
+  "OPCL" = "GRCL",
+  "OPIM" = "CYIMI",
+  "STNE2" = "HENE5"))
+
+# I don't know what these species are. exclude for now
+dest.harv.extend <- dest.harv.extend[!dest.harv.extend$kartez %in% c("PF3", "POAC6"),]
+
+# Find species in the all quad NPP file that are not in the taxo file
+allquad.sp.err <- unique(allquadNPP$kartez[!allquadNPP$kartez %in% taxo$kartez])
+
+#unique(allquadNPP[allquadNPP$kartez == "STEM" &
+#                         allquadNPP$site == "C",])
+
+# I don't know what these species are. exclude for now
+allquadNPP <- allquadNPP[!allquadNPP$kartez %in% c("STEM"),]
+```
+
+``` {r}
+# Species for which we have quad data but NO destructive measurements
+missing.dest <- merge(unique(allquadNPP[!allquadNPP$kartez %in% dest.harv.extend$kartez, c("year", "site", "kartez")]), taxo[,c("kartez", "family", "genus", "species", "path", "a_p", "g_f")], by="kartez", all.x=T)
+
+cat("  \n\n Species for which we have quad data but NO destructive measurements: \n")
+kable(unique(missing.dest[,c("kartez", "family", "genus", "species")]), format="pandoc")
+
+# Species for which we have destructive measurements but no quad data
+unused.reg <- merge(unique(dest.harv.extend[!dest.harv.extend$kartez %in% allquadNPP$kartez, c("Year", "Site", "kartez")]), taxo[,c("kartez", "family", "genus", "species", "path", "a_p", "g_f")], by="kartez", all.x=T)
+
+cat("  \n\n Species for which we have destructive measurements but no quad data: \n")
+kable(unique(unused.reg[,c("kartez", "family", "genus", "species")]), format="pandoc")
+
+```
+
+```{r}
+# Create full matrix for model output
+model.coefs.all <- data.frame(
+  kartez = as.factor(NA), 
+  Year = as.factor(NA),
+  Site = as.factor(NA), 
+  Season = as.factor(NA),
+  Treatment = as.factor(NA),
+  Beta.Volume = NA,
+  SE = NA,
+  p.value = NA,
+  AdjR = NA)
+```
+
+# Species Overviews
+
+```{r, echo=F, results="asis", fig.height=3.5, fig.width=8, warning=F}
+# Loop through all species
+#for (species in 1:length(unique(dest.harv.extend$kartez))) {
+for (species in 1:5) {
+  # Create subset dataframe for that species
+  sp.sub <- unique(dest.harv.extend[dest.harv.extend$kartez ==
+                                      unique(dest.harv.extend$kartez)[species] &
+                                      !is.na(dest.harv.extend$Volume) &
+                                      !is.na(dest.harv.extend$Live_Weight),])
+
+  #### Idea: could climate effects actually be assessed by looking at the residuals from the reconstructed volume:weight relationships per year-season?!
+  
+  
+  # Print summary of species' destructive harvest data
+  kartez <- as.character(unique(sp.sub$kartez))
+  family <- as.character(unique(sp.sub$family))
+  genus <- as.character(unique(sp.sub$genus))
+  sp.epithet <- as.character(unique(sp.sub$species))
+  path <- as.character(unique(sp.sub$path))
+  a_p <- as.character(unique(sp.sub$a_p))
+  g_f <- as.character(unique(sp.sub$g_f))
+  
+  # Species:
+  cat("  \n\n### Species:", kartez)
+  # Full taxonomy
+  cat(paste0("\n ***", genus, " ", sp.epithet, "*** (", family, ") - ", a_p, " ", path, " ", g_f))
+  ## Destructive harvest data
+  cat("  \n *Destructive Harvest Data*:")
+  # Number of observations: 
+  cat("  \n Number of observations: 
+      Total - ", length(sp.sub$Live_Weight), 
+      ", Winter - ", length(sp.sub$Live_Weight[sp.sub$Season == 1]),
+      ", Spring - ", length(sp.sub$Live_Weight[sp.sub$Season == 2]),
+      ", Fall - ", length(sp.sub$Live_Weight[sp.sub$Season == 3]))
+  # Sites sampled: 
+  Siteagg <- aggregate(sp.sub, list(sp.sub$Site), "length")
+  cat("  \n Sites sampled:", 
+      paste(paste(Siteagg[,1], Siteagg[,2], sep=" - "), collapse=", "))
+  # Years collected: 
+  Yragg <- aggregate(sp.sub, list(sp.sub$Year), "length")
+  cat("  \n Years collected:", 
+      paste(paste(Yragg[,1], Yragg[,2], sep=" - "), collapse=", "))
+  # Burn treatments considered?
+  if(length(unique(sp.sub$Treatment)) > 1) {cat("  \n Burn effects considered: Yes")
+  } else {cat("  \n Burn effects considered: No")}
+  # Size range:   
+  cat("  \n *Size range*: 
+      Cover:", min(sp.sub$Cover, na.rm=T), " - ", max(sp.sub$Cover, na.rm=T), 
+      ", Height:", min(sp.sub$Height, na.rm=T), " - ", max(sp.sub$Height, na.rm=T),
+      ", Volume:", min(sp.sub$Volume, na.rm=T), " - ", max(sp.sub$Volume, na.rm=T),
+      "Weight:", min(sp.sub$Live_Weight, na.rm=T), " - ", max(sp.sub$Live_Weight, na.rm=T), "  \n")
+  
+  Vol.range <- ggplot(sp.sub, aes(y=Volume, x=Year, group=Year)) + 
+    geom_boxplot() +
+    geom_jitter(aes(colour=Site)) +
+    xlim(c(1989,2017))
+  Weight.range <- ggplot(sp.sub, aes(y=Live_Weight, x=Year, group=Year)) + 
+    geom_boxplot() +
+    geom_jitter(aes(colour=Site)) +
+    xlim(c(1989,2017))    
+  
+  print(plot_grid(Vol.range, Weight.range, 
+                  align = 'h', nrow=2, rel_widths = c(1,1)))
+  
+  # If there are fewer than 20 samples, discontinue analysis and skip to next species
+  if (length(!is.na(sp.sub$Live_Weight)) < 20) next
+  
+  # Format Season and Year columns
+  sp.sub$Season <- as.factor(sp.sub$Season)
+  sp.sub$Year <- as.factor(sp.sub$Year)
+  # Determine p-values for interaction effects in "full model"
+  # Here we will consider Year, Site (or SiteCluster), Season (or SeasonTwo), and Treatment
+  # In future, precip, temp, and antecedent biomass might replace Year
+  # Season Clusters or Day of Year might replace Season
+  # Years Since Burn might replace Treatment
+  
+  # Create list of covariates possible for this species
+  #cov.sub
+  all.covariates <- unique(sp.sub[,c("Year", "Season", "SiteCluster", "Treatment")])
+  season.cov <- unique(sp.sub[,c("Year", "Season")])
+  site.cov <- unique(sp.sub[,c("Year", "SiteCluster")])
+  trt.cov <- unique(sp.sub[,c("Year", "Treatment")])
+  site.trt.cov <- unique(sp.sub[,c("SiteCluster", "Treatment")])
+  
+  
+  # Construct full.model formula
+  # Exclude covariates with limited (singular) data, as these will break gls()
+  full.model.string <- paste0("Live_Weight ~ 0 + Volume",
+    # require two years
+    if (length(unique(sp.sub$Year)) > 2){
+      # require a significant Volume:Year interaction
+      if (!is.na(anova(gls(Live_Weight ~ 0 + Volume*Year, data=sp.sub, na.action = na.exclude, control=list(singular.ok=T)))["Volume:Year", "p-value"]))
+        {" + Volume*Year"}},
+    # require each site to have been sampled twice
+    if (length(site.cov$SiteCluster[site.cov$SiteCluster=="L"]) > 1 &
+        length(site.cov$SiteCluster[site.cov$SiteCluster=="PJ"]) > 1 &
+        # require each site to have been sampled in overlapping years
+        sum(unique(all.covariates$Year[all.covariates$SiteCluster=="L"]) %in%
+        unique(all.covariates$Year[all.covariates$SiteCluster=="PJ"])) > 0){
+      # require a significant Volume:SiteCluster interaction
+      if (!is.na(anova(gls(Live_Weight ~ 0 + Volume*SiteCluster, data=sp.sub, na.action = na.exclude, control=list(singular.ok=T)))["Volume:SiteCluster", "p-value"]))
+        {" + Volume*SiteCluster"}},
+    # require each season to have been sampled twice
+    if (length(season.cov$Season[season.cov$Season=="1"]) > 1 &
+        length(season.cov$Season[season.cov$Season=="2"]) > 1 &
+        length(season.cov$Season[season.cov$Season=="3"]) > 1){
+      # require a significant Volume:Season interaction
+      if (!is.na(anova(gls(Live_Weight ~ 0 + Volume*Season, data=sp.sub, na.action = na.exclude, control=list(singular.ok=T)))["Volume:Season", "p-value"]))
+        {" + Volume*Season"}},
+    # require each treatment to have been sampled twice
+    if (length(trt.cov$Treatment[trt.cov$Treatment=="C"]) > 1 &
+        length(trt.cov$Treatment[trt.cov$Treatment=="B"]) > 1 &
+        # require each treatment to have been sampled in overlapping years
+        sum(unique(all.covariates$Year[all.covariates$Treatment=="C"]) %in%
+        unique(all.covariates$Year[all.covariates$Treatment=="B"])) > 0){
+      if (!is.na(anova(gls(Live_Weight ~ 0 + Volume*Treatment, data=sp.sub, na.action = na.exclude, control=list(singular.ok=T)))["Volume:Treatment", "p-value"]))
+        {" + Volume*Treatment"}})
+  
+  # Create model with all significant interaction terms
+  full.model <- anova(gls(as.formula(full.model.string),
+                          data=sp.sub,
+                          na.action = na.exclude),
+                      type="marginal")
+  
+  # Create concise table of significant interactions within full model
+  full.output <- data.frame(kartez = unique(sp.sub$kartez),
+    Vol.Year_p = NA, Vol.Site_p = NA, Vol.Season_p = NA, Vol.Trt_p = NA)
+  
+  full.output[,c("Vol.Year_p", "Vol.Site_p", "Vol.Season_p", "Vol.Trt_p")] <-
+    full.model[c("Volume:Year", "Volume:SiteCluster", "Volume:Season", "Volume:Treatment"), "p-value"]
+  
+  # Print full model
+  cat("  \n\n Model:", full.model.string, "  \n")
+  cat("  \n - Volume main effect:", full.model["Volume", "p-value"])
+  cat("  \n - Volume:Year interaction:", full.output$Vol.Year_p)
+  cat("  \n - Volume:Site interaction:", full.output$Vol.Site_p)
+  cat("  \n - Volume:Season interaction:", full.output$Vol.Season_p)
+  cat("  \n - Volume:Treatment interaction:", full.output$Vol.Trt_p, "  \n")
+  
+  # Plot full model
+  # Question for Jen. The v$res output holds some factors stationary and plots the residuals. So these plots only represent the residuals for one year+site+season+treatment. Is that helpful?
+  # For now, plotting raw data and residuals separately
+  
+  # Raw data plots
+  Y.fig.raw <- ggplot(data = sp.sub, aes(x = Volume, y = Live_Weight,
+                        group = Year, colour = Year, fill = Year)) +
+    theme(legend.position = "top") + ylim(0,max(sp.sub$Live_Weight, na.rm=T)) +
+    xlab('Volume') + ylab('Live_Weight') + guides(fill = guide_legend(nrow = 4)) +
+    geom_point(alpha=0.2, colour = "lightgray")
+  if (!is.na(full.output$Vol.Year_p) & full.output$Vol.Year_p < 0.05) {
+    Y.fig.raw <- Y.fig.raw + 
+      geom_point(alpha=.7) + 
+      stat_smooth(method="lm", fullrange=T) }
+  
+  Se.fig.raw <- ggplot(data = sp.sub, aes(x = Volume, y = Live_Weight, 
+                         group = Season, colour = Season, fill = Season)) +
+    theme(legend.position = "top", axis.title.y = element_blank(), axis.text.y = element_blank()) +
+    ylim(0,max(sp.sub$Live_Weight, na.rm=T)) +
+    xlab('Volume') + ylab('Live_Weight') + guides(fill = guide_legend(nrow = 3)) +
+    geom_point(alpha=0.2, colour="lightgray")
+  if (!is.na(full.output$Vol.Season_p) & full.output$Vol.Season_p < 0.05) {
+    Se.fig.raw <- Se.fig.raw + 
+      geom_point(alpha=.7) + 
+      stat_smooth(method="lm", fullrange=T) }
+  
+  Si.fig.raw <- ggplot(data = sp.sub, aes(x = Volume, y = Live_Weight, 
+                         group = SiteCluster, colour = SiteCluster, fill = SiteCluster)) +
+    theme(legend.position = "top", axis.title.y = element_blank(), axis.text.y = element_blank()) +
+    ylim(0,max(sp.sub$Live_Weight, na.rm=T)) +    
+    xlab('Volume') + ylab('Live_Weight') + guides(fill = guide_legend(nrow = 2)) +
+    geom_point(alpha=0.1, colour="lightgray")
+  if (!is.na(full.output$Vol.Site_p) & full.output$Vol.Site_p < 0.05) {
+    Si.fig.raw <- Si.fig.raw + 
+      geom_point(alpha=.7) + 
+      stat_smooth(method="lm", fullrange=T) }
+  
+  T.fig.raw <- ggplot(data = sp.sub, aes(x = Volume, y = Live_Weight, 
+                         group = Treatment, colour = Treatment, fill = Treatment)) +
+    theme(legend.position = "top", axis.title.y = element_blank(), axis.text.y = element_blank()) +
+    ylim(0,max(sp.sub$Live_Weight, na.rm=T)) + 
+    xlab('Volume') + ylab('Live_Weight') + guides(fill = guide_legend(nrow = 2)) +
+    geom_point(alpha=0.1, colour="lightgray")
+  if (!is.na(full.output$Vol.Trt_p) & full.output$Vol.Trt_p < 0.05) {
+    T.fig.raw <- T.fig.raw +
+      geom_point(alpha=.7) + 
+      stat_smooth(method="lm", fullrange=T) }
+  
+  print(plot_grid(Y.fig.raw, Se.fig.raw, Si.fig.raw, T.fig.raw, align = 'h', nrow=1, rel_widths = c(1.25,1,1,1)))
+  
+  # Residual plots
+  Y.fig.res <- ggplot(data = sp.sub, aes(x = Volume, y = Live_Weight, 
+                         group = Year, colour = Year, fill = Year)) +
+    theme(legend.position = "top") + ylim(0,max(sp.sub$Live_Weight, na.rm=T)) +
+    xlab('Volume') + ylab('Live_Weight_resid') +
+    guides(fill = guide_legend(nrow = 4),
+           colour = guide_legend(nrow = 4)) +
+    geom_point(alpha=0, colour="lightgray")
+  if (!is.na(full.output$Vol.Year_p) & full.output$Vol.Year_p < 0.05) {
+    v <- visreg(lm(full.model.string, data=sp.sub), 
+                  xvar="Volume", by="Year", plot=F)
+    Y.fig.res <- Y.fig.res + 
+      geom_point(data=v$res, aes(Volume, visregRes), alpha=.7) +
+      geom_line(data=v$fit, aes(Volume, visregFit), size=1.3) +
+      geom_ribbon(data=v$fit, aes(ymin=visregLwr, ymax=visregUpr), alpha=0.3, colour=NA) }
+  
+  Se.fig.res <- ggplot(data = sp.sub, aes(x = Volume, y = Live_Weight, 
+                         group = Season, colour = Season, fill = Season)) +
+    theme(legend.position = "top", axis.title.y = element_blank(), axis.text.y = element_blank()) +
+    ylim(0,max(sp.sub$Live_Weight, na.rm=T)) +
+    xlab('Volume') + guides(fill = guide_legend(nrow = 3),
+                            colour = guide_legend(nrow = 3)) +
+    geom_point(alpha=0)
+  if (!is.na(full.output$Vol.Season_p) & full.output$Vol.Season_p < 0.05) {
+    v <- visreg(lm(full.model.string, data=sp.sub), xvar="Volume", by="Season", plot=F)
+    Se.fig.res <- Se.fig.res + 
+      geom_point(data=v$res, aes(Volume, visregRes), alpha=.7) +
+      geom_line(data=v$fit, aes(Volume, visregFit), size=1.3) +
+      geom_ribbon(data=v$fit, aes(ymin=visregLwr, ymax=visregUpr), alpha=0.3, colour=NA)}
+  
+  Si.fig.res <- ggplot(data = sp.sub, aes(x = Volume, y = Live_Weight, 
+                         group = SiteCluster, colour = SiteCluster, fill = SiteCluster)) +
+    theme(legend.position = "top", axis.title.y = element_blank(), axis.text.y = element_blank()) +
+    ylim(0,max(sp.sub$Live_Weight, na.rm=T)) +    
+    xlab('Volume') + guides(fill = guide_legend(nrow = 2),
+                            colour = guide_legend(nrow = 2)) +
+    geom_point(alpha=0)
+  if (!is.na(full.output$Vol.Site_p) & full.output$Vol.Site_p < 0.05) {
+    v <- visreg(lm(full.model.string, data=sp.sub), xvar="Volume", by="SiteCluster", plot=F)
+    Si.fig.res <- Si.fig.res + 
+      geom_point(data=v$res, aes(Volume, visregRes), alpha=.7) +
+      geom_line(data=v$fit, aes(Volume, visregFit), size=1.3) +
+      geom_ribbon(data=v$fit, aes(ymin=visregLwr, ymax=visregUpr), alpha=0.3, colour=NA)}
+  
+  T.fig.res <- ggplot(data = sp.sub, aes(x = Volume, y = Live_Weight, 
+                         group = Treatment, colour = Treatment, fill = Treatment)) +
+    theme(legend.position = "top", axis.title.y = element_blank(), axis.text.y = element_blank()) +
+    ylim(0,max(sp.sub$Live_Weight, na.rm=T)) + 
+    xlab('Volume') + guides(fill = guide_legend(nrow = 2),
+                            colour = guide_legend(nrow = 2)) +
+    geom_point(alpha=0)
+  if (!is.na(full.output$Vol.Trt_p) & full.output$Vol.Trt_p < 0.05) {
+    v <- visreg(lm(full.model.string, data=sp.sub), xvar="Volume", by="Treatment", plot=F)
+    T.fig.res <- T.fig.res + 
+      geom_point(data=v$res, aes(Volume, visregRes), alpha=.7) +
+      geom_line(data=v$fit, aes(Volume, visregFit), size=1.3) +
+      geom_ribbon(data=v$fit, aes(ymin=visregLwr, ymax=visregUpr), alpha=0.3, colour=NA)}
+  
+  print(plot_grid(Y.fig.res, Se.fig.res, Si.fig.res, T.fig.res, align = 'h', nrow=1, rel_widths = c(1.25,1,1,1)))
+  
+
+  # Loop through models for each combination of Year, Site, Season, and Treatment (depending on which factors had significant interaction terms in the full model)
+  model.coefs.sp <-
+    unique(sp.sub[!is.na(sp.sub$Live_Weight) & !is.na(sp.sub$Volume),
+                  c("kartez", "Year", "Site", "Season", "Treatment")])
+  
+  # Select only columns for terms that were significant in model
+  if (is.na(full.output$Vol.Year_p) | full.output$Vol.Year_p > 0.05) 
+    {model.coefs.sp$Year <- NULL}
+  if (is.na(full.output$Vol.Site_p) | full.output$Vol.Site_p > 0.05) 
+    {model.coefs.sp$Site <- NULL}
+  if (is.na(full.output$Vol.Season_p) | full.output$Vol.Season_p > 0.05) 
+    {model.coefs.sp$Season <- NULL}
+  if (is.na(full.output$Vol.Trt_p) | full.output$Vol.Trt_p > 0.05)
+    {model.coefs.sp$Treatment <- NULL}
+  
+  model.coefs.sp <- unique(model.coefs.sp)
+  sig.factors <- names(model.coefs.sp)
+  
+  # Create linear model for each line in data.frame
+  # Extract beta, SE, and Adjust R-squared from model
+  model.coefs.sp[,c("Beta.Volume", "SE", "p.value", "AdjR")] <- NA
+  
+  for (i in 1:length(model.coefs.sp[,1])) {
+    model.coefs.sp[i, c("Beta.Volume", "SE", "p.value")] <- summary(lm(
+      Live_Weight ~ 0 + Volume,
+      data=sp.sub[interaction(sp.sub[,sig.factors]) %in%
+                    interaction(model.coefs.sp[i,sig.factors]),]))$coefficients[c(1,2,4)]
+    model.coefs.sp[i, c("AdjR")] <- summary(lm(
+      Live_Weight ~ 0 + Volume,
+      data=sp.sub[interaction(sp.sub[,sig.factors]) %in%
+                    interaction(model.coefs.sp[i,sig.factors]),]))$adj.r.squared
+    }
+  
+  # Merge output from this species onto all-species output matrix
+  model.coefs.all <- merge(model.coefs.all, model.coefs.sp, all=T)
+  model.coefs.all <- model.coefs.all[!is.na(model.coefs.all$kartez),]
+
+}
+
+write.csv(model.coefs.all, "~/Desktop/SevPlantBiomass_29Aug17.csv")
+```
+

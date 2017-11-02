@@ -1,0 +1,4 @@
+"0","# Capitalize site and species names"
+"0","raw.data$site <- as.factor(toupper(raw.data$site))"
+"0","raw.data$kartez <- as.factor(toupper(raw.data$kartez))"
+"0","raw.data$treatment <- as.factor(toupper(raw.data$treatment))"

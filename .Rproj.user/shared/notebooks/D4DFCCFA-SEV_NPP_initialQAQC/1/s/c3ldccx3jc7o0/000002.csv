@@ -1,0 +1,111 @@
+"0","# Load R packages that will be used"
+"0","# This list is long because Alesia is lazy "
+"0","library(ggplot2)"
+"0","library(lubridate)"
+"2","
+Attaching package: ‘lubridate’
+
+"
+"2","The following object is masked from ‘package:base’:
+
+    date
+
+"
+"0","library(plyr)"
+"2","
+Attaching package: ‘plyr’
+
+"
+"2","The following object is masked from ‘package:lubridate’:
+
+    here
+
+"
+"0","library(reshape2)"
+"0","library(gridExtra)"
+"0","library(cowplot)"
+"2","
+Attaching package: ‘cowplot’
+
+"
+"2","The following object is masked from ‘package:ggplot2’:
+
+    ggsave
+
+"
+"0","library(knitr)"
+"0","library(markdown)"
+"0","library(xtable)"
+"0","library(zoo)"
+"2","
+Attaching package: ‘zoo’
+
+"
+"2","The following objects are masked from ‘package:base’:
+
+    as.Date, as.Date.numeric
+
+"
+"0","library(tidyr)"
+"2","
+Attaching package: ‘tidyr’
+
+"
+"2","The following object is masked from ‘package:reshape2’:
+
+    smiths
+
+"
+"0","library(stats)"
+"0","library(car)"
+"2","package ‘car’ was built under R version 3.4.1"
+"0","library(nlme)"
+"0","library(visreg)"
+"2","package ‘visreg’ was built under R version 3.4.1"
+"0","library(ggmap)"
+"2","Google Maps API Terms of Service: http://developers.google.com/maps/terms.
+"
+"2","Please cite ggmap if you use it: see citation('ggmap') for details.
+"
+"2","
+Attaching package: ‘ggmap’
+
+"
+"2","The following object is masked from ‘package:cowplot’:
+
+    theme_nothing
+
+"
+"0","library(sp)"
+"2","package ‘sp’ was built under R version 3.4.1"
+"0","library(gdata)"
+"2","gdata: read.xls support for 'XLS' (Excel 97-2004) files ENABLED.
+"
+"2","
+"
+"2","gdata: read.xls support for 'XLSX' (Excel 2007+) files ENABLED.
+"
+"2","
+Attaching package: ‘gdata’
+
+"
+"2","The following object is masked from ‘package:gridExtra’:
+
+    combine
+
+"
+"2","The following object is masked from ‘package:stats’:
+
+    nobs
+
+"
+"2","The following object is masked from ‘package:utils’:
+
+    object.size
+
+"
+"2","The following object is masked from ‘package:base’:
+
+    startsWith
+
+"

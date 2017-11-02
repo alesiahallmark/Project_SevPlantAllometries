@@ -1,0 +1,8 @@
+"0","# Fill in blank site, plot, and quad cells"
+"0","for (i in 1:nrow(raw.data)) {"
+"0","  if (is.na(raw.data$site[i])) raw.data$site[i] <- raw.data$site[i-1]"
+"0","  if (is.na(raw.data$treatment[i])) raw.data$treatment[i] <- raw.data$treatment[i-1]"
+"0","  if (is.na(raw.data$quad[i])) raw.data$quad[i] <- raw.data$quad[i-1]"
+"0","  if (is.na(raw.data$kartez[i])) raw.data$kartez[i] <- raw.data$kartez[i-1]"
+"0","}"
+"0","  "

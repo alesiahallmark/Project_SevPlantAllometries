@@ -1,0 +1,7 @@
+"0","### Directory information"
+"0","# Where are the raw (or copies of the raw) data files stored?"
+"0","location_raw.data.sheets <- ""~/Desktop/test_field_crew_data/"""
+"0","# Where is the large, all-quad data file stored?"
+"0","all.quad.file <- ""/Users/alesia/Documents/Project_SevPublicPlantRCode/NPP_quad_met2016.csv"""
+"0","# Where is the master species list stored?"
+"0","master.species.list.file <- ""~/Documents/Project_SevPublicPlantRCode/SevilletaSpeciesList_AJH.csv"""

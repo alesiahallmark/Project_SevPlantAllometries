@@ -1,0 +1,284 @@
+---
+title: "SEVPlantBiomass_16Aug17"
+author: "AJ"
+date: "8/16/2017"
+output: html_document
+---
+
+##Background
+Several long-term studies at the Sevilleta LTER measure net primary production (NPP) across ecosystems and treatments. Net primary production is a fundamental ecological variable that quantifies rates of carbon consumption and fixation. Estimates of NPP are important in understanding energy flow at a community level as well as spatial and temporal responses to a range of ecological processes. Above-ground net primary production (ANPP) is the change in plant biomass, including loss to death and decomposition, over a given period of time. To measure this change, vegetation variables, including species composition and the cover and height of individuals, are sampled up to three times yearly (winter, spring, and fall) at permanent plots within a study site. Sevilleta LTER dataset 157 includes cover, height, and dry biomass measurements obtained through destructive harvesting. These species are always harvested from habitat comparable to the plots in which they were recorded.
+
+##Purpose
+The following R code utilizes volume (cover*height) and weight data from Sev dataset 157 to create regressions which can be used to estimate seasonal biomass for plant species across the Sevilleta.
+
+```{r load.packages, include=FALSE}
+# Load R packages which will be used in this script
+library(ggplot2)
+library(lubridate)
+library(plyr)
+library(reshape2)
+library(gridExtra)
+library(cowplot)
+library(knitr)
+library(markdown)
+library(xtable)
+library(zoo)
+library(tidyr)
+library(stats)
+library(car)
+library(nlme)
+```
+
+### Special Notes
+Eventually, this script will output a report for each species for which we have destructive harvest biomass data. This report will describe the optimal model for estimating biomass of each species. Possible predictor variables will include:  
+-individual plant volume (height*cover)
+-site at which plant occurs
+-season (or day of year) during which plant was observed
+-treatment (burned or unburned)
+-*year during which destructive harvest sample was collected  
+
+**note*: If year of collection plays a significant role in predicting biomass, antecedent precipitation, temperature, or previous season's biomass should be considered when predicting biomass for that species
+
+### Step 1: Preparing the data
+SEV dataset 157 (version 20161218) is used here.
+```{r, include=F}
+# Read in SEV 157 and format columns
+dest.harv.raw <- read.csv("/Users/alesia/Documents/Project_SevPublicPlantRCode/sev157_nppweight_20161218.csv", strip.white=T)
+
+# Look at the data
+summary(dest.harv.raw)
+
+# Modify column names
+names(dest.harv.raw)[names(dest.harv.raw) == "Species"] <- "kartez"
+
+# Convert error data to NA's
+dest.harv <- dest.harv.raw[,1:14]
+dest.harv$Treatment[dest.harv$Treatment == ""] <- NA
+dest.harv$Observation[dest.harv$Observation < 1] <- NA
+dest.harv$Count[is.na(dest.harv$Count)] <- 0
+dest.harv$Cover[dest.harv$Cover < 0.01 | dest.harv$Cover > 100] <- NA
+dest.harv$Height[dest.harv$Height < 1] <- NA
+dest.harv$Live_Weight[dest.harv$Live_Weight < 0.01] <- NA
+dest.harv$Live_Weight[dest.harv$Live_Weight < 0] <- NA
+
+# Calculate volume
+dest.harv$Volume <- dest.harv$Cover * dest.harv$Height
+
+# Duplicate rows with Counts greater than 1
+dest.harv.extend <- dest.harv[rep(row.names(dest.harv), dest.harv$Count), c("Year", "Season", "Date", "Site", "Treatment", "kartez", "Cover", "Height", "Live_Weight", "Volume")]
+
+# Make a SiteCluster column
+dest.harv.extend$SiteCluster <- revalue(dest.harv.extend$Site, c(
+  "C" = "L",
+  "G" = "L",
+  "CG" = "L",
+  "B" = "L",
+  "P" = "PJ",
+  "J" = "PJ"))
+
+# Make a SeasonTwo column
+dest.harv.extend$SeasonTwo <- revalue(as.factor(dest.harv.extend$Season), c(
+  "1" = "winter",
+  "2" = "growing",
+  "3" = "growing"))
+
+# Burn treatment effects more useful if coded as "years since burn"
+#summary(as.factor(dest.harv.extend$Year[dest.harv.extend$Treatment == "B"]))
+dest.harv.extend$SinceBurn <- NA
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "C" & 
+                             dest.harv.extend$Site == "L" & 
+                             dest.harv.extend$Year < 2010] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "C" &
+                          dest.harv.extend$Site == "L" &
+                          dest.harv.extend$Year < 2010] - 1985
+
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "C" & 
+                             dest.harv.extend$Site == "L" & 
+                             dest.harv.extend$Year > 2009] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "C" &
+                          dest.harv.extend$Site == "L" &
+                          dest.harv.extend$Year > 2009] - 2003
+
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Year < 2010] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "B" &
+                          dest.harv.extend$Year < 2010] - 2003
+
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Date == "10/20/2009"] <- 0
+                        
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Year > 2009] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "B" &
+                          dest.harv.extend$Year > 2009] - 2009
+
+#unique(dest.harv.extend[dest.harv.extend$Site=="L", c("Year", "Site", "SinceBurn", "Treatment")])
+
+# Format Season and Year columns
+dest.harv.extend$Season <- as.factor(dest.harv.extend$Season)
+dest.harv.extend$Year <- as.factor(dest.harv.extend$Year)
+
+```
+
+The data look like this:
+
+```{r, echo=F}
+# The data look like this
+kable(head((dest.harv.extend), format="pandoc"))
+```
+
+```{r}
+# Create full matrix for model output
+model.coefs.all <- data.frame(
+  kartez = as.factor(NA), 
+  Year = as.factor(NA),
+  Site = as.factor(NA), 
+  Season = as.factor(NA),
+  Treatment = as.factor(NA),
+  Beta.Volume = NA,
+  SE = NA,
+  p.value = NA,
+  AdjR = NA)
+```
+
+
+We will consider the following species. 
+
+```{r, include=F}
+# Loop through all species
+for (species in 1:length(unique(dest.harv.extend$kartez))) {
+
+sp.sub <- dest.harv.extend[dest.harv.extend$kartez == 
+                             unique(dest.harv.extend$kartez)[species],]
+
+
+#Species: 
+#  unique(sp.sub$kartez) 
+#Number of observations: 
+#  length(sp.sub$Observation)
+#Sites collected: 
+#  unique(sp.sub$Site)
+#Years collected: 
+#  min(sp.sub$Year, na.rm=T)
+#  max(sp.sub$Year, na.rm=T)
+#Size range:   
+#  Cover: `r min(sp.sub$Cover, na.rm=T)` - `r max(sp.sub$Cover, na.rm=T)`  
+#  Height: `r min(sp.sub$Height, na.rm=T)` - `r max(sp.sub$Height, na.rm=T)`  
+#  Volume: `r min(sp.sub$Volume, na.rm=T)` - `r max(sp.sub$Volume, na.rm=T)`  
+#  Weight: `r min(sp.sub$Live_Weight, na.rm=T)` - `r max(sp.sub$Live_Weight, na.rm=T)`  
+  
+
+  
+# Determine p-values for interaction effects in "full model"
+# Here we will consider Year, Site (or SiteCluster), Season (or SeasonTwo), and Treatment
+# In future, precip, temp, and antecedent biomass might replace Year
+# Season Clusters or Day of Year might replace Season
+# Years Since Burn might replace Treatment
+
+if (length(row.names(unique(sp.sub[sp.sub$Treatment=="B",c("Year", "Season", "SiteCluster", "Treatment")]))) > 1) {
+  full.model <-
+    anova(gls(Live_Weight ~ 0 +
+                Volume*Year +
+                Volume*SiteCluster +
+                Volume*Season +
+                Volume*Treatment,
+              data=sp.sub,
+              na.action = na.exclude),
+          type="marginal")
+  
+  # Output
+full.output <- data.frame(
+  kartez = unique(sp.sub$kartez),
+  Vol.Year_p = full.model[row.names(full.model) == "Volume:Year", "p-value"],
+  Vol.Site_p = full.model[row.names(full.model) == "Volume:SiteCluster", "p-value"],
+  Vol.Season_p = full.model[row.names(full.model) == "Volume:Season", "p-value"],
+  Vol.Trt_p = full.model[row.names(full.model) == "Volume:Treatment", "p-value"])
+
+} else {
+  full.model <-
+    anova(gls(Live_Weight ~ 0 +
+                Volume*Year +
+                Volume*SiteCluster +
+                Volume*Season,
+              data=sp.sub,
+              na.action = na.exclude),
+          type="marginal")
+  
+  # Output
+  full.output <- data.frame(
+  kartez = unique(sp.sub$kartez),
+  Vol.Year_p = full.model[row.names(full.model) == "Volume:Year", "p-value"],
+  Vol.Site_p = full.model[row.names(full.model) == "Volume:SiteCluster", "p-value"],
+  Vol.Season_p = full.model[row.names(full.model) == "Volume:Season", "p-value"],
+  Vol.Trt_p = 1)
+}
+
+
+
+# Output
+#full.output <- data.frame(
+#  kartez = unique(sp.sub$kartez),
+#  Vol.Year_p = full.model[row.names(full.model) == "Volume:Year", "p-value"],
+#  Vol.Site_p = full.model[row.names(full.model) == "Volume:SiteCluster", "p-value"],
+#  Vol.Season_p = full.model[row.names(full.model) == "Volume:Season", "p-value"],
+#  Vol.Trt_p = full.model[row.names(full.model) == "Volume:Treatment", "p-value"])
+
+# Plot
+#library(visreg)
+#visreg(full.model)
+
+
+# Loop through models for each combination of Year, Site, Season, and Treatment (depending on which factors had significant interaction terms in the full model)
+model.coefs.sp <- 
+  unique(sp.sub[!is.na(sp.sub$Live_Weight) & !is.na(sp.sub$Volume),
+                c("kartez", "Year", "SiteCluster", "Season", "Treatment")])
+
+# Select only columns for terms that were significant in model
+if (full.output$Vol.Year_p > 0.05) {
+  model.coefs.sp$Year <- NULL} 
+if (full.output$Vol.Site_p > 0.05) {
+  model.coefs.sp$SiteCluster <- NULL} 
+if (full.output$Vol.Season_p > 0.05) {
+  model.coefs.sp$Season <- NULL} 
+if (full.output$Vol.Trt_p > 0.05) {
+  model.coefs.sp$Treatment <- NULL} 
+
+model.coefs.sp <- unique(model.coefs.sp)
+sig.factors <- names(model.coefs.sp)
+
+# Create linear model for each line in data.frame
+# Extract beta, SE, and Adjust R-squared from model
+model.coefs.sp$Beta.Volume <- NA
+model.coefs.sp$SE <- NA
+model.coefs.sp$p.value <- NA
+model.coefs.sp$AdjR <- NA
+
+for (i in 1:length(model.coefs.sp[,1])) {
+  model.coefs.sp[i, c("Beta.Volume", "SE", "p.value")] <- summary(lm(
+    Live_Weight ~ 0 + Volume,
+    data=sp.sub[interaction(sp.sub[,sig.factors]) %in%
+                  interaction(model.coefs.sp[i,sig.factors]),]))$coefficients[c(1,2,4)]
+  model.coefs.sp[i, c("AdjR")] <- summary(lm(
+    Live_Weight ~ 0 + Volume,
+    data=sp.sub[interaction(sp.sub[,sig.factors]) %in%
+                  interaction(model.coefs.sp[i,sig.factors]),]))$adj.r.squared}
+
+# Merge output from this species onto all-species output matrix
+model.coefs.all <- merge(model.coefs.all, model.coefs.sp, all=T)
+model.coefs.all <- model.coefs.all[!is.na(model.coefs.all$kartez),]
+
+beta.sp.plot <- ggplot(model.coefs.sp, 
+                       aes(x=Year, y=Beta.Volume,
+                           group=Season, colour=Season, shape=SiteCluster)) +
+  geom_point(position = position_jitterdodge()) +
+  geom_errorbar(data = model.coefs.sp, 
+                aes(x=Year, ymin=Beta.Volume - SE, ymax=Beta.Volume + SE),
+                position = position_dodge(), width=0.6) +
+  facet_grid(SiteCluster~Treatment) + ylim(0,0.8) +
+  ggtitle(model.coefs.sp$kartez)
+
+#print(beta.sp.plot)
+
+}
+```
+
