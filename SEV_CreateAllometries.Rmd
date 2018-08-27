@@ -1,0 +1,2250 @@
+---
+title: "SEV_PlantBiomass_Allometries"
+author: "AJ"
+date: '`r Sys.time()`'
+output: html_document
+---
+
+##Background
+Several long-term studies at the Sevilleta LTER measure net primary production (NPP) across ecosystems and treatments. Net primary production is a fundamental ecological variable that quantifies rates of carbon consumption and fixation. Estimates of NPP are important in understanding energy flow at a community level as well as spatial and temporal responses to a range of ecological processes. Above-ground net primary production (ANPP) is the change in plant biomass, including loss to death and decomposition, over a given period of time. To measure this change, vegetation variables, including species composition and the cover and height of individuals, are sampled up to three times yearly (winter, spring, and fall) at permanent plots within a study site. Sevilleta LTER dataset 157 includes cover, height, and dry biomass measurements obtained through destructive harvesting. These species are always harvested from habitat comparable to the plots in which they were recorded.
+
+#### Required input files
+The following R code requires four source files:  
+- Sev dataset 157, which includes volume (cover x height) and weight data from destructively harvested individuals. This is used to create regressions which can be used to estimate seasonal biomass from volumetric observations for plant species across the Sevilleta.  
+- All available per-quad observations of plant volume and height from across the Sevilleta to characterize the range of plant sizes to which we are applying biomass regressions. (file from email sent from J Rudgers 12 Sept 2017)  
+- a file containing seasonal meteorological summaries from stations 40, 42, 49, and 50.
+- A file with species names tied to additional taxonomic and life history trait info (Alesia's personal species list used here)
+
+### Products
+This script itself is a product. The code should be transparent and easily reproducible. 
+
+This script, when knit, creates a PDF report for every species in the Sev 157 or "all quad" data files. Demographic data, number of observations, and descriptions of linear models will be listed for each species, along with figures which visually describe model interactions. 
+Predictor variables  include:  
+-individual plant volume (height*cover)
+-site at which plant occurs
+-site-year (representing a unique climate year) during which plant was collected
+-season during which plant was observed
+-treatment (converted into real or estimated years since site was burned)
+
+A .csv file is created that includes linear model slopes and p-values for each pairwise comparison of the above the terms. 
+
+A list of high-priority species to destructively harvest will also be created. This list will include a reason for suggested harvest and size classes for which we desire samples.
+
+```{r load.packages, include=FALSE}
+# Load R packages which will be used in this script
+library(ggplot2)
+library(RColorBrewer)
+library(lubridate)
+library(plyr)
+library(reshape2)
+library(gridExtra)
+library(cowplot)
+library(knitr)
+library(markdown)
+library(xtable)
+library(zoo)
+library(tidyr)
+library(stats)
+library(car)
+library(nlme)
+library(lme4)
+library(visreg)
+library(data.table)
+```
+
+```{r}
+# This code can be knit into a full PDF report (which take quite a long time) or simply output a .csv of slopes. Pick your poison. [the.long.way v. quickie]
+poison <- "the.long.way"
+```
+
+### Step 1: Preparing the data
+SEV dataset 157 (version 20161218) is used here.
+```{r, include=F}
+# Read in SEV 157 and format columns
+dest.harv.raw <- read.csv("/Users/alesia/Documents/Project_SevPublicPlantRCode/sev157_nppweight_20180326.csv", strip.white=T)
+
+# Look at the data
+summary(dest.harv.raw)
+
+# Modify column names
+names(dest.harv.raw)[names(dest.harv.raw) == "Species"] <- "kartez"
+
+# Convert error data to NA's
+dest.harv <- dest.harv.raw[,1:14]
+dest.harv$Treatment[dest.harv$Treatment == ""] <- NA
+dest.harv$Observation[dest.harv$Observation < 1] <- NA
+dest.harv$Count[is.na(dest.harv$Count)] <- 0
+dest.harv$Cover[dest.harv$Cover < 0.01 | dest.harv$Cover > 100] <- NA
+dest.harv$Height[dest.harv$Height < 1] <- NA
+dest.harv$Live_Weight[dest.harv$Live_Weight < 0.01] <- NA
+dest.harv$Live_Weight[dest.harv$Live_Weight < 0] <- NA
+
+# Calculate volume and lankiness
+dest.harv$Volume <- dest.harv$Height * dest.harv$Cover
+dest.harv$Lankiness <- dest.harv$Height / dest.harv$Cover
+
+# Duplicate rows with Counts greater than 1
+dest.harv.extend <- dest.harv[rep(row.names(dest.harv), dest.harv$Count), c("Year", "Season", "Date", "Site", "Treatment", "kartez", "Cover", "Height", "Live_Weight", "Volume", "Lankiness")]
+
+dest.harv.extend$Site <- revalue(dest.harv.extend$Site, c(
+  "PJ" = "P"))
+
+# Make a SiteCluster column
+dest.harv.extend$SiteCluster <- revalue(dest.harv.extend$Site, c(
+  "L" = "DeepWell",
+  "C" = "FivePoints",
+  "G" = "FivePoints",
+  "CG" = "FivePoints",
+  "B" = "BlueGrama",
+  "P" = "CerroMontosa",
+  "J" = "CerroMontosa"))
+
+# Burn treatment effects more useful if coded as "years since burn"
+#summary(as.factor(dest.harv.extend$Year[dest.harv.extend$Treatment == "B"]))
+# Assume that all sites were burned in 1980
+dest.harv.extend$SinceBurn <-
+  dest.harv.extend$Year - 1980
+# After 2009 fire, "Control" collections came from area burned in 2003
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "C" & 
+                             dest.harv.extend$Site == "L" & 
+                             dest.harv.extend$Year > 2009] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "C" &
+                          dest.harv.extend$Site == "L" &
+                          dest.harv.extend$Year > 2009] - 2003
+# Before 2009 fire, "Burn" collections came from area burned in 2003
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Year < 2010] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "B" &
+                          dest.harv.extend$Year < 2010] - 2003
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Date == "10/20/2009"] <- 0
+# After 2009 fire, "Burn" collections came from area burned in 2009
+dest.harv.extend$SinceBurn[dest.harv.extend$Treatment == "B" & 
+                             dest.harv.extend$Year > 2009] <-
+  dest.harv.extend$Year[dest.harv.extend$Treatment == "B" &
+                          dest.harv.extend$Year > 2009] - 2009
+
+
+# Arrange by species name in alphabetical order
+dest.harv.extend <- dest.harv.extend[with(dest.harv.extend, order(kartez, Year, Season)),]
+
+```
+
+The data look like this:
+
+```{r, echo=F}
+# The data look like this
+kable(head((dest.harv.extend), format="pandoc"))
+```
+
+```{r, include=F}
+# Read in met data
+# custom file generated by AJ using SEVmetsummary_AJmod R code
+metdata <- read.csv("~/Desktop/SEVmetAJ_29Mar18.csv")
+metdata$Sta <- as.factor(metdata$Sta)
+
+# reshape into Year Season Site and reduce to columns of interest
+springmetdata <- metdata[,c("Sta", "water_year", "precip.annual", "precip.spring", "GDD.spring", "spring12SPEI.thornth", "spring6SPEI.thornth")]
+colnames(springmetdata) <- c("MetStation", "Year", "annual.precip", "season.precip", "GDD", "SPEI12.thornth", "SPEI6.thornth")
+springmetdata$Season <- 2
+monsoonmetdata <- metdata[,c("Sta", "water_year", "precip.annual", "precip.monsoon", "GDD.monsoon", "monsoon12SPEI.thornth", "monsoon6SPEI.thornth")]
+colnames(monsoonmetdata) <- c("MetStation", "Year", "annual.precip", "season.precip", "GDD", "SPEI12.thornth", "SPEI6.thornth")
+monsoonmetdata$Season <- 3
+
+metdata <- rbind(springmetdata, monsoonmetdata)
+
+metdata$MetStation <- as.factor(metdata$MetStation)
+```
+
+```{r, include=F, message=F}
+# Match site names with nearest met stations
+dest.harv.extend$MetStation <- 
+  revalue(dest.harv.extend$Site,
+          c(L = 40, # Deep well
+            P = 42, PJ = 42, J = 42, # Cerro Montosa PJ
+            G = 49, C = 49, CG = 49, # Five Points
+            B = 50)) # Blue grama
+
+# Five Points and Savannah sites don't have complete met data for 1999. Blue grama site doesn't have complete met data for 2002. Fill using nearest met station 
+ddply(metdata[metdata$MetStation %in% c(40,42,49,50) , c("Year", "Season", "MetStation", "season.precip", "SPEI12.thornth")], "MetStation", function(x) data.frame(x[1,]))
+
+dest.harv.extend$MetStation[dest.harv.extend$MetStation == 49 &
+                              dest.harv.extend$Year == 1999 & 
+                              dest.harv.extend$Season == 2] <- 42
+dest.harv.extend$MetStation[dest.harv.extend$MetStation == 50 &
+                              dest.harv.extend$Year < 2002] <- 42
+
+```
+
+
+```{r, include=F}
+# read in all Sev quad data
+allquadNPP <- read.csv("/Users/alesia/Documents/Project_SevPublicPlantRCode/NPP_quad_met2016.csv", strip.white = T, na.strings = c("NA", ".", " "))
+
+# reshape data.frame to long format
+#colnames(allquadNPP)
+allquadNPP <- gather(allquadNPP, key = kartez, value = prev.mass, 21:242)
+allquadNPP <- allquadNPP[allquadNPP$prev.mass > 0,]
+
+# reduce to columns of interest
+allquadNPP <- allquadNPP[,c("year", "site", "treat", "season", "web", "plot", "subplot", "kartez", "prev.mass")]
+colnames(allquadNPP) <- c("year", "site", "treatment", "season", "web", "plot", "subplot", "kartez", "prev.mass")
+
+allquadNPP$kartez <- as.factor(toupper(allquadNPP$kartez))
+
+allquadNPP$site <- revalue(allquadNPP$site, c(
+  "BUR" = "BG",
+  "BURN03" = "B03",
+  "BURN09" = "B09"))
+
+# create SiteCluster column 
+allquadNPP$SiteCluster <- revalue(allquadNPP$site, c(
+  "B" = "BlueGrama",
+  "BG" = "DeepWell",
+  "B03" = "DeepWell",
+  "B09" = "DeepWell",
+  "C" = "FivePoints",
+  "CG" = "FivePoints",
+  "EB" = "BlueGrama",
+  "EG" = "FivePoints",
+  "F" = "DeepWell",
+  "G" = "FivePoints",
+  "GG" = "FivePoints",
+  "M" = "FivePoints",
+  "MG" = "DeepWell",
+  "MS" = "FivePoints",
+  "N" = "DeepWell",
+  "P" = "CerroMontosa",
+  "W" = "DeepWell"))
+
+# The plot numbers in Jenn's NPP file are all changed. Try to make them match the quad data:
+#unique(allquadNPP[allquadNPP$site == "EB", c("site", "treatment", "web", "plot", "subplot")])
+
+# Match site names with nearest met stations
+allquadNPP$MetStation <- 
+  revalue(allquadNPP$SiteCluster,
+          c(DeepWell = 40, # Deep well
+            CerroMontosa = 42, # Cerro Montosa PJ
+            FivePoints = 49, # Five Points
+            BlueGrama = 50)) # Blue grama
+
+#ggplot(allquadNPP[allquadNPP$kartez == unique(allquadNPP$kartez)[25] & allquadNPP$season == 3,], aes(x=log10(prev.mass), y=..count.., group=biome, fill=biome)) + geom_histogram() 
+
+```
+
+```{r, include=F}
+# Read in all_quad volumetric data
+allquadVOL <- read.csv("/Users/alesia/Desktop/unsorted_AJdata/AJ_AllQuads.csv", strip.white = T)
+
+allquadVOL$kartez <- as.factor(toupper(allquadVOL$kartez))
+
+allquadVOL$cover[allquadVOL$cover < 0] <- NA
+allquadVOL$height[allquadVOL$height < 0] <- NA
+
+allquadVOL$volume <- allquadVOL$cover * allquadVOL$height
+
+allquadVOL$site <- revalue(allquadVOL$site, c(
+  "BURN03" = "B03",
+  "BURN09" = "B09"))
+
+allquadVOL$SiteCluster <- revalue(allquadVOL$site, c(
+  "B" = "BlueGrama",
+  "BG" = "DeepWell",
+  "B03" = "DeepWell",
+  "B09" = "DeepWell",
+  "C" = "FivePoints",
+  "CG" = "FivePoints",
+  "EB" = "BlueGrama",
+  "EG" = "FivePoints",
+  "F" = "DeepWell",
+  "G" = "FivePoints",
+  "GG" = "FivePoints",
+  "M" = "FivePoints",
+  "MG" = "DeepWell",
+  "MS" = "FivePoints",
+  "N" = "DeepWell",
+  "P" = "CerroMontosa",
+  "W" = "DeepWell"))
+
+# Match site names with nearest met stations
+allquadVOL$MetStation <- 
+  revalue(allquadVOL$SiteCluster,
+          c(DeepWell = 40, # Deep well
+            CerroMontosa = 42, # Cerro Montosa PJ
+            FivePoints = 49, # Five Points
+            BlueGrama = 50)) # Blue grama
+
+# Need to make sure all the observations get kept, even if the rows are identical
+allquadVOL$row.obs <- row.names(allquadVOL)
+
+
+```
+
+```{r, include=F}
+# Read in species' taxonomy data
+taxo <- read.csv("/Users/alesia/Documents/Project_SevPublicPlantRCode/SevilletaSpeciesList_AJH.csv", strip.white = T, na.strings = c("NA",""))
+
+# Revalue a_p and g_f columns
+taxo$a_p <- revalue(taxo$a_p, c(
+  "a" = "annual",
+  "p" = "perennial",
+  "a/p" = "ann/peren"))
+taxo$g_f <- revalue(taxo$g_f, c(
+  "f" = "forb",
+  "t" = "tree", 
+  "g" = "grass",
+  "s" = "shrub"))
+
+# Merge taxonomy file onto other two datasets
+# This first merge is to find errors (fe)
+dest.harv.fe <- merge(dest.harv.extend, unique(taxo[,c("kartez", "family", "genus", "species", "path", "a_p", "g_f")]), by="kartez", all.x=T)
+dest.harv.fe <- merge(dest.harv.fe, metdata, by=c("MetStation", "Year", "Season"), all.x=T)
+allquadNPP.fe <- merge(allquadNPP, allquadVOL, c("year", "season", "SiteCluster", "site", "MetStation", "treatment", "web", "plot", "subplot", "kartez"), all = T)
+allquadNPP.fe <- merge(allquadNPP.fe, taxo[,c("kartez", "family", "genus", "species", "path", "a_p", "g_f")], by="kartez", all.x=T)
+
+#summary(dest.harv.fe[!is.na(dest.harv.fe$season.precip),])
+
+# find incorrect species names - outdated synonyms
+USDA.species <- read.csv("https://plants.usda.gov/java/stateDownload?statefips=US35", header = T, strip.white = T, na.strings = c("NA", ""))
+synonyms <- unique(dest.harv.fe$kartez[dest.harv.fe$kartez %in% USDA.species$Synonym.Symbol])
+cat("  \n\n Species names that were updated to their correct synonym in all datasets: \n")
+USDA.species[USDA.species$Synonym.Symbol %in% synonyms,]
+
+# Find species in the destructive harvest file that are not in the taxo file
+dest.sp.err <- unique(dest.harv.fe$kartez[!dest.harv.fe$kartez %in% taxo$kartez])
+# Find species in the NPP file that are not in the taxo file
+NPP.sp.err <- unique(allquadNPP$kartez[!allquadNPP$kartez %in% taxo$kartez])
+
+```
+
+```{r echo = F, warning = F, results = "asis"}
+
+# Exclude unknown species and empty plots
+dest.harv.fe <- dest.harv.fe[!dest.harv.fe$kartez %in% c("NONE", "FORB1", "UKFO10", "UKFO13", "UKFO17", "UKFO18", "UKFO75", "UKFO80", "UKSH5"),]
+
+# Exclude woody/shrubby species. Need to be treated separately
+dest.harv.fe <- dest.harv.fe[!dest.harv.fe$kartez %in% c("LATR2", "LATR2F", "LATR2L", "LATR2T", "LATR2W", "QUTU2B", "YUBAC", "YUBAL"),]
+
+#dest.harv.extend[dest.harv.extend$kartez == "MUPA",]
+#allquadNPP[allquadNPP$kartez == "MUPA2",]
+
+# Correct typos
+dest.harv.fe$kartez <- revalue(dest.harv.fe$kartez, c(
+  "CHLA2" = "CHAL11", #guess based on cover/height/presence in other datasets
+  "CHST" = "CHST8", #these don't even have heights
+  "DIW12" = "DIWI2",
+  "MUPA" = "MUPA2",
+  "SPOR" = "SPORO"))
+
+# Correct typos
+allquadNPP$kartez <- revalue(allquadNPP$kartez, c(
+  "SATR2" = "SATR12",
+  "SPP06" = "SPPO6", 
+  "OPUN" = "OPUNT"))
+allquadVOL$kartez <- revalue(allquadVOL$kartez, c(
+  "SATR2" = "SATR12",
+  "SPP06" = "SPPO6", 
+  "OPUN" = "OPUNT"))
+
+# Update old species names
+dest.harv.fe$kartez <- revalue(dest.harv.fe$kartez, c(
+  "ARPUP6" = "ARPU9",
+  "ASMIM" = "ASFE2",
+  "CHGR2" = "DYGR",
+  "LEDED" = "LEDE",
+  "GACO5" = "OESU3",
+  "GASUN" = "OESUN",
+  "GLBIC" = "GLBI2",
+  "GLWR" = "GLBIC",
+  "GUWR" = "GUSP",
+  "OECAC2" = "OECA10",
+  "MOSQ" = "MUSQ3",
+  "MUPA" = "MUSP4",
+  "OPCL" = "GRCL",
+  "OPIM" = "CYIMI",
+  "OPPHP" = "OPPH",
+  "PHIN" = "PHCR",
+  "STNE2" = "HENE5",
+  "SPWR" = "SPPO6",
+  "LEOV" = "LEPI3"))
+
+allquadNPP$kartez <- revalue(allquadNPP$kartez, c(
+  "ASMIM" = "ASFE2",
+  "CHGR2" = "DYGR",
+  "GACO5" = "OESU3",
+  "GASUN" = "OESUN",
+  "GUWR" = "GUSP",
+  "PHIN" = "PHCR",
+  "SPWR" = "SPPO6"))
+allquadVOL$kartez <- revalue(allquadVOL$kartez, c(
+  "ASMIM" = "ASFE2",
+  "CHGR2" = "DYGR",
+  "LEDED" = "LEDE",
+  "GACO5" = "OESU3",
+  "GASUN" = "OESUN",
+  "GUWR" = "GUSP",
+  "PHIN" = "PHCR",
+  "SPWR" = "SPPO6"))
+
+# Some "morphospecies" that relate to genera are sometimes identified in the field. REPLICATE data from species that might be included in these morphospecies clusters so that an allomoetry can be made for them
+#summary(dest.harv.fe[dest.harv.fe$kartez %in% c("CHSE7", "CHSES"),])
+#CHSES and CHSE7
+#CHFE3 and CHCHC3
+#CHST8 (not very common) and CHAL11
+#Sporobolus (not SPAI)
+#Quercus
+#Opuntia- especially in PJ
+#Aristida could be grouped- EXCEPT ARAD.
+#AMBL and AMAL could be grouped
+#GAPI and GAPU could be grouped
+#GUSP and GUWR could be grouped
+#COAR4 and COEQ grow in similar form
+#BOGR2 and BOHI2 in PJ- there are many issues between these two, but I think you could share a weight regression.   BOHI2 doesn't get very big anyway. 
+
+summary(allquadVOL[allquadVOL$kartez == "CYIMI" & 
+                           allquadVOL$season %in% c(2, 3) &
+                     allquadVOL$height > 20,])
+
+
+# Species for which we have quad data but NO destructive measurements
+missing.dest <- merge(unique(allquadNPP[!allquadNPP$kartez %in% dest.harv.fe$kartez, c("year", "site", "kartez")]), taxo[,c("kartez", "family", "genus", "species", "path", "a_p", "g_f")], by="kartez", all.x=T)
+missing.dest <- missing.dest[!is.na(missing.dest$species),]
+
+cat("  \n\n Species for which we have quad data but NO destructive measurements: \n")
+kable(unique(missing.dest[,c("kartez", "family", "genus", "species")]), format="pandoc")
+
+
+#test <- allquadNPP.fe
+#test$year <- as.factor(test$year)
+#test$season <- as.factor(test$season)
+#test$site <- as.character(test$site)
+#test$site[test$site == "MG"] <- paste(test$site[test$site == "MG"], test$treatment[test$site == "MG"], sep = "_")
+#test$site <- as.factor(test$site)
+
+
+
+#summary(test[test$kartez == "TRRA5", c("genus", "species", "year", "season", "site", "web", "plot", "subplot", "SiteCluster", "cover", "height")])
+
+#       kartez   family             genus            species         
+# ----  -------  -----------------  ---------------  ----------------
+# 1     AMAL     Amaranthaceae      Amaranthus       albus           # rare but consistently noted
+# 5     AMBL     Amaranthaceae      Amaranthus       blitoides       # Only 14 observations at  one site/timepoint. possible, but could be misidentified. Use AMAL regression
+# 137   ASFL2    Fabaceae           Astragalus       flexuosus       # Only noted in 2015/2016. Real, verified by Stephanie
+# 184   CHCHC3   Euphorbiaceae      Chamaesyce       chaetocalyx     # very common at PJ. Could have been misidentified in past (CHFE3, other Chams)
+# 190   COAR4    Convolvulaceae     Convolvulus      arvensis        # Only 3 observations at one site/timepoint. Use COEQ regression (which we don't have)
+# 191   COAU2    Fumariaceae        Corydalis        aurea           # Only 9 scattered observations. Low priority
+# 195   COEQ     Convolvulaceae     Convolvulus      equitans        # fairly common
+# 208   CRCI3    Boraginaceae       Cryptantha       cinerea         # fairly common at monsoon. PJ ID's probably wrong. Only at Monsoon
+# 222   ECFEF3   Cactaceae          Echinocereus     fendleri        # fairly common. Similar in shape to ECIN2
+# 243   ERAB2    Polygonaceae       Eriogonum        abertianum      # 56 observations
+# 257   ERTE13   Geraniaceae        Erodium          texanum         # fairly common
+# 266   FUCR     Asclepiadaceae     Funastrum        crispum         # fairly common at P in the last few years
+# 270   GAPU     Asteraceae         Gaillardia       pulchella       # rare. Use GAPI regression when we get it
+# 306   HENA     Lamiaceae          Hedeoma          nana            # fairly common at P
+# 315   HOGL2    Fabaceae           Hoffmannseggia   glauca          # common at NutNet before 2013, very probably HODR
+# 319   HORU     Rubiaceae          Houstonia        rubra           # fairly common at M
+# 325   HYVE     Violaceae          Hybanthus        verticillatus   # fairly common at B and P
+# 334   IPCO2    Convolvulaceae     Ipomoea          costellata      # very common at Blue
+# 353   IPLO2    Polemoniaceae      Ipomopsis        longiflora      # few at P in 2007, probably SCMU6 or HEPI2 or IPLA2 at this size. Can't verify ID with such small plants. In the flats, probably IPLA2. Use IPLA2 regression (when we get it)
+# 356   KAHI     Zygophyllaceae     Kallstroemia     hirsutissima    # few at F. Just added to species list an more common into the future. Could use KAPA regression, but is denser
+# 360   LEPI3    Brassicaceae       Lesquerella      pinetorum       # very common at P. Use LEFE regression in the meantime
+# 374   MACA2    Asteraceae         Machaeranthera   canescens       # rare
+# 377   MATA2    Asteraceae         Machaeranthera   tanacetifolia   # rare
+# 384   MESC     Oleaceae           Menodora         scabra          # common at C and M
+# 407   MOCE     Molluginaceae      Mollugo          cerviana        # common
+# 419   MUFR     Poaceae            Muhlenbergia     fragilis        # very rare. only 2 observations at P
+# 420   OPPOP    Cactaceae          Opuntia          polyacantha     # a few consistent observations
+# 436   PAHI5    Poaceae            Panicum          hirticaule      # only observed in 2011
+# 439   PELO3    Brassicaceae       Pennellia        longifolia      # very rare, consistent
+# 451   PHCR     Hydrophyllaceae    Phacelia         crenulata       # very common
+# 476   PHHE4    Solanaceae         Physalis         hederifolia     # rare but consistent at P. 
+# 481   PHLO15   Portulacaceae      Phemeranthus     longipes        # rare but consistent
+# 483   PHLOL3   Solanaceae         Physalis         longifolia      # rare, only one site-date. Use PHHE4 (when we get it)
+# 487   QUPA     Fagaceae           Quercus          palaeolithicola # rare but consistent
+# 495   RANE     Asteraceae         Rafinesquia      neomexicana     # very rare
+
+# 496   SCLA6    Asteraceae         Scorzonera       laciniata       # rare, only in older data
+# 502   SCPA10   Cactaceae          Sclerocactus     papyracanthus   # fairly common. Similar to ESVIV and ECIN2
+# 524   SIAL2    Brassicaceae       Sisymbrium       altissimum      # only identified in two years
+# 527   SPPO6    Malvaceae          Sphaeralcea      polychroma      # very common. Used to be SPWR, those names should all be changed
+# 710   TEAR4    Asteraceae         Tetraneuris      argentea        # rare, consistent
+# 713   THME     Asteraceae         Thelesperma      megapotamicum   # rare, only seen in one year. Maybe make a tiny rare forb regression
+# 719   ASSP     Asclepiadaceae     Asclepias        speciosa        # only one record
+# 720   BAPT     Asteraceae         Baccharis        pteronioides    # Just in one quad. Similar shape as BAWR
+# 731   CAWR     Asteraceae         Calycoseris      wrightii        # rare
+# 736   COCA5    Asteraceae         Conyza           canadensis      # rare
+# 737   CYLE8    Cactaceae          Cylindropuntia   leptocaulis     # rare
+# 738   ERDI2    Polemoniaceae      Eriastrum        diffusum        # rare
+# 739   ERME     Poaceae            Eragrostis       mexicana        # very common in 2013-14
+# 741   HEOB     Lamiaceae          Hedeoma          oblongifolia    # fairly common at PJ. Use HENA when we get it
+# 746   JUMO     Cupressaceae       Juniperus        monosperma      # woody, keep separate
+# 756   KRLA     Krameriaceae       Krameria         lanceolata      # rare
+# 759   LACO13   Asteraceae         Laennecia        coulteri        # rare
+# 760   MAHEH2   Cactaceae          Mammilaria       heyderi         # rare
+# 767   ORLUM    Orobanchaceae      Orobanche        ludoviciana     # rare, only seen one season
+# 769   PAIN2    Asteraceae         Parthenium       incanum         # rare, only observed on one date
+# 771   PEBA2    Scrophulariaceae   Penstemon        barbatus        # rare
+# 775   PIED     Pinaceae           Pinus            edulis          # woody, keep separate
+# 791   PRPA2    Pedaliaceae        Proboscidea      parviflora      # only one record
+# 806   RHMI3    Anacardiaceae      Rhus             microphylla     # only one record
+# 810   TRRA5    Euphorbiaceae      Tragia           ramosa          # only one record
+
+# Species for which we have destructive measurements but no quad data
+unused.reg <- merge(unique(dest.harv.fe[!dest.harv.fe$kartez %in% as.factor(unique(c(as.character(allquadNPP$kartez), as.character(allquadVOL$kartez)))), c("Year", "Site", "kartez")]), taxo[,c("kartez", "family", "genus", "species", "path", "a_p", "g_f")], by="kartez", all.x=T)
+
+cat("  \n\n Species for which we have destructive measurements but no quad data: \n")
+kable(unique(unused.reg[,c("kartez", "Year", "Site", "family", "genus", "species")]), format="pandoc")
+
+
+# I don't know what these species are. exclude for now
+dest.harv.fe <- dest.harv.fe[!dest.harv.fe$kartez %in% c("PF3", "POAC6"),]
+
+# Find species in the all quad NPP file that are not in the taxo file
+allquad.sp.err <- unique(allquadNPP.fe$kartez[!allquadNPP.fe$kartez %in% taxo$kartez])
+
+#unique(allquadNPP[allquadNPP$kartez == "STEM" &
+#                         allquadNPP$site == "C",])
+
+# I don't know what these species are. exclude for now
+#allquadNPP <- allquadNPP[!allquadNPP$kartez %in% c("STEM"),]
+
+### These kartez codes in the dest. data can probably be synonimized
+dest.harv.fe$kartez <- revalue(dest.harv.fe$kartez, c(
+  "FEAR2" = "POFE"
+))
+
+# Throw out individual values that are potential outliers
+dest.harv.fe$Live_Weight[dest.harv.fe$kartez == "BOGR2" & dest.harv.fe$Season == 2 & dest.harv.fe$Live_Weight > 60] <- NA
+dest.harv.fe$Cover[dest.harv.fe$kartez == "BOGR2" & dest.harv.fe$Season == 2 & dest.harv.fe$Live_Weight > 60] <- NA
+```
+
+``` {r, echo=F, results="asis"}
+### Merge cleaned up datasets
+# Destructive data
+dest.harv <- merge(
+  dest.harv.fe[,c("MetStation", "Year", "Season", "kartez", "Date", "Site", "Treatment", "Cover", "Height", "Live_Weight", "Volume", "Lankiness", "SiteCluster", "SinceBurn")], 
+  unique(taxo[,c("kartez", "family", "genus", "species", "path", "a_p", "g_f")]), by = "kartez", all.x = T)
+
+dest.harv <- merge(dest.harv, metdata, by=c("MetStation", "Year", "Season"), all.x=T)
+
+# All quad (ind plants) data
+allquadNPP <- merge(allquadNPP, allquadVOL, c("year", "season", "SiteCluster", "site", "MetStation", "treatment", "web", "plot", "subplot", "kartez"), all = T)
+allquadNPP <- merge(allquadNPP, taxo[,c("kartez", "family", "genus", "species", "path", "a_p", "g_f")], by = "kartez", all.x = T)
+metdatamod <- metdata[,c("MetStation", "Year", "Season", "season.precip", "GDD", "SPEI6.thornth")]
+colnames(metdatamod) <- c("MetStation", "year", "season", "season.precip", "GDD", "SPEI6.thornth")
+allquadNPP <- merge(allquadNPP, metdatamod, by = c("MetStation", "year", "season"), all.x = T)
+
+```
+
+```{r echo=F, fig.height=2.7, fig.width=2.7}
+
+# Now we need to z-score our climate variables
+# First, assess distribution of data
+z.scores.spring <- unique(dest.harv[dest.harv$Season == 2, c("Year", "MetStation", "Season", "SPEI6.thornth", "GDD", "season.precip")])
+hist(z.scores.spring$SPEI6.thornth, main="Spring SPEI_6mo", xlab="SPEI_6mo", cex=0.5)
+hist(z.scores.spring$GDD, main="Spring GDD", xlab="GDD", cex=0.5)
+hist(z.scores.spring$season.precip, main="Spring precip", xlab="season.precip", cex=0.5)
+
+z.scores.monsoon <- unique(dest.harv[dest.harv$Season == 3, c("Year", "MetStation", "Season", "SPEI6.thornth", "GDD", "season.precip")])
+hist(z.scores.monsoon$SPEI6.thornth, main="Monsoon SPEI_6mo", xlab="SPEI_6mo", cex=0.5)
+hist(z.scores.monsoon$GDD, main="Monsoon GDD", xlab="GDD", cex=0.5)
+hist(z.scores.monsoon$season.precip, main="Monsoon precip", xlab="season.precip", cex=0.5)
+
+z.scores.spring[,c("z.6SPEI", "z.GDD", "z.precip")] <- 
+  c(scale(z.scores.spring$SPEI6.thornth, center=T, scale=T),
+    scale(z.scores.spring$GDD, center=T, scale=T),
+    scale(z.scores.spring$season.precip, center=T, scale=T))
+
+z.scores.monsoon[,c("z.6SPEI", "z.GDD", "z.precip")] <- 
+  c(scale(z.scores.monsoon$SPEI6.thornth, center=T, scale=T),
+    scale(z.scores.monsoon$GDD, center=T, scale=T),
+    scale(z.scores.monsoon$season.precip, center=T, scale=T))
+
+z.scores <- rbind(z.scores.spring, z.scores.monsoon)
+
+dest.harv <- merge(dest.harv, z.scores, by = c("Year", "MetStation", "Season", "SPEI6.thornth", "GDD", "season.precip"), all=T)
+
+# Define SPEI, GDD, and precip limits for each season
+clim.limits <- data.frame(
+  Season = c(2,3),
+  min.SPEI = c(
+    min(dest.harv$SPEI6.thornth[dest.harv$Season == 2], na.rm = T), 
+    min(dest.harv$SPEI6.thornth[dest.harv$Season == 3], na.rm = T)),
+  max.SPEI = c(
+    max(dest.harv$SPEI6.thornth[dest.harv$Season == 2], na.rm = T), 
+    max(dest.harv$SPEI6.thornth[dest.harv$Season == 3], na.rm = T)),
+  min.GDD = c(
+    min(dest.harv$GDD[dest.harv$Season == 2], na.rm = T), 
+    min(dest.harv$GDD[dest.harv$Season == 3], na.rm = T)),
+  max.GDD = c(
+    max(dest.harv$GDD[dest.harv$Season == 2], na.rm = T), 
+    max(dest.harv$GDD[dest.harv$Season == 3], na.rm = T)),
+  min.precip = c(
+    min(dest.harv$season.precip[dest.harv$Season == 2], na.rm = T), 
+    min(dest.harv$season.precip[dest.harv$Season == 3], na.rm = T)),
+  max.precip = c(
+    max(dest.harv$season.precip[dest.harv$Season == 2], na.rm = T),
+    max(dest.harv$season.precip[dest.harv$Season == 3], na.rm = T))
+)
+
+
+```
+
+# Species Overviews
+
+```{r echo = F}
+# Define color palettes for figures
+SiteCluster.colors <- c("CerroMontosa" = "#1b9e77", 
+                        "BlueGrama" = "#d95f02", 
+                        "DeepWell" = "#7570b3", 
+                        "FivePoints" = "#e7298a")
+SiteCluster.shapes <- c("CerroMontosa" = 24, 
+                        "BlueGrama" = 22, 
+                        "DeepWell" = 21, 
+                        "FivePoints" = 23)
+visreg.colors <- colorRampPalette(brewer.pal(9,"Greens")[2:9])(20)
+model.colors <- c("all.yr.vol" = "#006d2c", 
+                  "spei.vol" = "#810f7c", 
+                  "gdd.vol" = "#b30000", 
+                  "precip.vol" = "#045a8d",
+                  "all.yr.cov" = "#2ca25f", 
+                  "spei.cov" = "#8856a7", 
+                  "gdd.cov" = "#e34a33", 
+                  "precip.cov" = "#2b8cbe")
+model.shapes <- c("all.yr.vol" = 17, 
+                  "spei.vol" = 17, 
+                  "gdd.vol" = 17, 
+                  "precip.vol" = 17,
+                  "all.yr.cov" = 19, 
+                  "spei.cov" = 19, 
+                  "gdd.cov" = 19, 
+                  "precip.cov" = 19)
+
+# This function creates figures showing size range of samples
+sizerange.fig.func <- function(size.df, x.var, xlim.max, plot.position) {
+  if(all(is.na(size.df[,x.var]))) plot <- NULL
+  else {
+    plot <- ggplot(size.df, aes_string(x = x.var)) + 
+      theme_cowplot(font_size = 9) + 
+      scale_fill_manual(name = "Site Cluster", values = SiteCluster.colors) +
+      xlim(NA,xlim.max) 
+    # log-transform the y-axis if there are a lot of samples
+    if(dim(size.df)[1] > 100) {
+      plot <- plot + 
+        scale_y_log10() + ylab("log10(obs.)") }
+    if(dim(size.df)[1] <= 100) {
+      plot <- plot + ylab("obs.") }
+    # change axes labels and legend based on plot.position
+    if(plot.position %in% c("left", "center")) {
+      plot <- plot + 
+        geom_histogram(bins = 15, aes(fill = SiteCluster), show.legend = F) }
+    if(plot.position %in% c("center", "right")) {
+      plot <- plot + 
+        theme(axis.title.y = element_blank()) }
+    if(plot.position %in% c("right")) {
+      plot <- plot +
+        geom_histogram(bins = 15, aes(fill = SiteCluster)) +
+        theme(legend.key.size = unit(0.5, "lines"), legend.position=c(0.6,0.85)) }}
+  plot
+}
+```
+
+```{r, echo = F, results = "asis", fig.height = 3.5, fig.width = 8, warning = F, message = F}
+# The following data will be output, when enough samples are present
+all.output <- 
+  data.frame(
+    kartez = NA,
+    genus = NA,
+    sp.epithet = NA,
+    family = NA,
+    LifeHistory = NA,
+    PhotoPath = NA,
+    FunctionalGroup = NA,
+    season = NA,
+    total.samp = NA,
+    burn.excluded = NA,
+    model = NA,
+    model.samp = NA,
+    clim.years = NA,
+    main.slope = NA,
+    main.p = NA,
+    inter.slope = NA,
+    inter.p = NA,
+    AIC = NA,
+    dAIC = NA)
+
+# Need to average in enough zeros to predictions. Count quads/site/year
+num.quads <- unique(allquadNPP[allquadNPP$site %in% c("B", "C", "G", "P") & allquadNPP$treatment == "C", c("year", "site", "web", "plot", "subplot")])
+num.quads <- as.data.frame(data.table(num.quads)[, list(
+  num.quads = length(subplot)),
+  by = list(year, site)])
+num.quads$num.quads[num.quads$num.quads %in% c(38, 39, 41)] <- 40
+num.quads$num.quads[num.quads$num.quads %in% c(78)] <- 80
+
+if (poison == "the.long.way") {
+# Order dataset by species in alphabetical order
+dest.harv <- dest.harv[order(as.character(dest.harv$kartez)),]
+
+# Loop through all species
+#for (species in 1:length(unique(dest.harv$kartez))) {
+for (species in 81:length(unique(dest.harv$kartez))) {
+#for (species in which(unique(dest.harv$kartez) %in% c("BOER4", "BOGR2", "GUSA2", "PLJA", "ACHY"))) {
+  
+  # Create subset dataframe for that species
+  sp.sub <- unique(dest.harv[
+    dest.harv$kartez == unique(dest.harv$kartez)[species] & 
+      !is.na(dest.harv$Volume) & 
+      !is.na(dest.harv$Live_Weight),
+    c("kartez", "Site", "SiteCluster", "MetStation", "Date", "Year", "Season", "Treatment", "SinceBurn", "Cover", "Height", "Live_Weight", "Volume", "Lankiness", "SPEI6.thornth", "GDD", "season.precip", "z.6SPEI", "z.GDD", "z.precip", "family", "genus", "species", "path", "a_p", "g_f")])
+  
+  # Order dataset by season 
+  sp.sub <- sp.sub[order(sp.sub$Season),]
+  
+  if(dim(sp.sub[sp.sub$Season != 1,])[1] == 0) next
+
+  # Create a similar subset of the actual NPP data
+  NPP.sub <- unique(allquadNPP[allquadNPP$kartez == as.character(unique(dest.harv$kartez)[species]),])
+  
+  # Print summary of species' destructive harvest data
+  kartez <- as.character(unique(sp.sub$kartez))
+  family <- as.character(unique(sp.sub$family))
+  genus <- as.character(unique(sp.sub$genus))
+  sp.epithet <- as.character(unique(sp.sub$species))
+  path <- as.character(unique(sp.sub$path))
+  a_p <- as.character(unique(sp.sub$a_p))
+  g_f <- as.character(unique(sp.sub$g_f))
+  
+  # Species:
+  cat("  \n\n### Species:", kartez)
+  # Full taxonomy
+  cat(paste0("\n#### ***", genus, " ", sp.epithet, "*** (", family, ") - ", a_p, " ", path, " ", g_f))
+  
+  # Number of observations: 
+  cat("  \n **Number of destructive harvest samples**: 
+      Total - ", length(sp.sub$Live_Weight), 
+      ", Winter - ", length(sp.sub$Live_Weight[sp.sub$Season == 1]),
+      ", Spring - ", length(sp.sub$Live_Weight[sp.sub$Season == 2]),
+      ", Fall - ", length(sp.sub$Live_Weight[sp.sub$Season == 3]))
+  cat("  \n **Number of NPP observations**: 
+      Total - ", length(NPP.sub$volume[!is.na(NPP.sub$volume)]), 
+      ", Winter - ", length(NPP.sub$volume[!is.na(NPP.sub$volume) & NPP.sub$season == 1]),
+      ", Spring - ", length(NPP.sub$volume[!is.na(NPP.sub$volume) & NPP.sub$season == 2]),
+      ", Fall - ", length(NPP.sub$volume[!is.na(NPP.sub$volume) & NPP.sub$season == 3]))
+  # Sites sampled: 
+  Siteagg <- aggregate(sp.sub[sp.sub$Season != 1,], 
+                       list(sp.sub$Site[sp.sub$Season != 1]), "length")
+  cat("  \n **Sites sampled in spring and fall**:", 
+      paste(paste(Siteagg[,1], Siteagg[,2], sep=" - "), collapse=", "))
+  NPPSiteagg <- NA
+  if(dim(NPP.sub[!is.na(NPP.sub$volume) & NPP.sub$season != 1,])[1] > 0) { 
+    NPPSiteagg <- aggregate(
+      NPP.sub[!is.na(NPP.sub$volume) & NPP.sub$season != 1,],
+      list(NPP.sub$site[!is.na(NPP.sub$volume) & NPP.sub$season != 1]), "length")
+    cat("  \n **Observations made at each site**:", 
+        paste(paste(NPPSiteagg[,1], NPPSiteagg[,2], sep=" - "), collapse=", ")) }
+  # Years collected: 
+  Yragg.harv <- aggregate(sp.sub, list(sp.sub$Year), "length")
+  cat("  \n **Years harvested**:", 
+      paste(paste(Yragg.harv[,1], Yragg.harv[,2], sep=" - "), collapse=", "))
+  Yragg.NPP <- NA
+  if(dim(NPP.sub[!is.na(NPP.sub$volume) & NPP.sub$season != 1,])[1] > 0) { 
+    Yragg.NPP <- aggregate(NPP.sub, list(NPP.sub$year), "length")
+    cat("  \n **Years observed**:", 
+        paste(paste(Yragg.NPP[,1], Yragg.NPP[,2], sep=" - "), collapse=", "))}
+  # Burn treatment samples: 
+  cat("  \n **Samples collected in burned plots**:", length(sp.sub$Live_Weight[!is.na(sp.sub$Live_Weight) & sp.sub$Treatment == "B"])) 
+
+  # Size range:   
+  cat("  \n\n ***Size range***:  [5%, 50%, 75%, 99%, max]")
+  cat("  \n **Harvest data**: 
+  Cover:", paste(c(
+    round(quantile(sp.sub$Cover, na.rm=T, probs = c(.05, .5, .75, .99)),2), 
+    round(max(sp.sub$Cover, na.rm=T),2)), collapse = ", "),
+  ", Height:", paste(c(
+    round(quantile(sp.sub$Height, na.rm=T, probs = c(.05, .5, .75, .99)),2), 
+    round(max(sp.sub$Height, na.rm=T),2)), collapse = ", "),
+  ", Volume:", paste(c(
+    round(quantile(sp.sub$Volume, na.rm=T, probs = c(.05, .5, .75, .99)),2), 
+    round(max(sp.sub$Volume, na.rm=T),2)), collapse = ", "),
+  "Weight:", paste(c(
+    round(quantile(sp.sub$Live_Weight, na.rm=T, probs = c(.05, .5, .75, .99)),2), 
+    round(max(sp.sub$Live_Weight, na.rm=T),2)), collapse = ", ")) 
+  if(dim(NPP.sub)[1] > 0) {  
+    cat("  \n **NPP data**: 
+      Cover:", paste(c(
+        round(quantile(NPP.sub$cover, na.rm=T, probs = c(.05, .5, .75, .99)),2), 
+        round(max(NPP.sub$cover, na.rm=T),2)), collapse = ", "), 
+      ", Height:", paste(c(
+        round(quantile(NPP.sub$height, na.rm=T, probs = c(.05, .5, .75, .99)),2), 
+        round(max(NPP.sub$height, na.rm=T),2)), collapse = ", "),
+      ", Volume:", paste(c(
+        round(quantile(NPP.sub$volume, na.rm=T, probs = c(.05, .5, .75, .99)),2), 
+        round(max(NPP.sub$volume, na.rm=T),2)), collapse = ", "),
+      "Weight:", paste(c(
+        round(quantile(NPP.sub$prev.mass, na.rm=T, probs = c(.01, .25, .5, .75, .99)),2), 
+        round(max(NPP.sub$prev.mass, na.rm=T),2)), collapse = ", ")) }
+  cat("  \n ")
+  
+  # Relevel Site Clusters
+  sp.sub$SiteCluster <- factor(sp.sub$SiteCluster, 
+  levels = c("CerroMontosa", "BlueGrama", "DeepWell", "FivePoints"))
+  NPP.sub$SiteCluster <- factor(NPP.sub$SiteCluster, 
+  levels = c("CerroMontosa", "BlueGrama", "DeepWell", "FivePoints"))
+    
+  dest.vol.fig <- sizerange.fig.func(
+    size.df = sp.sub, x.var = "Volume", plot.position = "left",
+    xlim.max = max(c(sp.sub$Volume, NPP.sub$volume[!NPP.sub$site %in% c("N")]), na.rm=T))
+  dest.cover.fig <- sizerange.fig.func(
+    size.df = sp.sub, x.var = "Cover", plot.position = "center", 
+    xlim.max = max(c(sp.sub$Cover, NPP.sub$cover[!NPP.sub$site %in% c("N")]), na.rm=T))
+  dest.weight.fig <- sizerange.fig.func(
+    size.df = sp.sub, x.var = "Live_Weight", plot.position = "right", 
+    xlim.max = max(sp.sub$Live_Weight, na.rm=T))
+  NPP.vol.fig <- sizerange.fig.func(
+    size.df = NPP.sub[!NPP.sub$site %in% c("N"),], x.var = "volume", plot.position = "left",
+    xlim.max = max(c(sp.sub$Volume, NPP.sub$volume[!NPP.sub$site %in% c("N")]), na.rm=T))
+  NPP.cover.fig <- sizerange.fig.func(
+    size.df = NPP.sub[!NPP.sub$site %in% c("N"),], x.var = "cover", plot.position = "center",
+    xlim.max = max(c(sp.sub$Cover, NPP.sub$cover[!NPP.sub$site %in% c("N")]), na.rm=T))
+  NPP.weight.fig <- sizerange.fig.func(
+    size.df = NPP.sub[!NPP.sub$site %in% c("N"),], x.var = "prev.mass", plot.position = "right",
+    xlim.max = max(NPP.sub$prev.mass[!NPP.sub$site %in% c("N")], na.rm=T))
+    
+  print(plot_grid(dest.vol.fig, dest.cover.fig, dest.weight.fig,
+                    NPP.vol.fig, NPP.cover.fig, NPP.weight.fig,
+                    align = 'hv', nrow=2))
+  
+  # Subset to the first season we'll consider
+  sp.sub <- sp.sub[sp.sub$Season != 1,]
+  for (season in 1:length(unique(sp.sub$Season))) {
+    se.sp.sub <- unique(sp.sub[sp.sub$Season ==
+                                 unique(sp.sub$Season)[season],]) 
+    
+    # Format Season, Year, and Site-Year columns
+    se.sp.sub$Season <- as.factor(se.sp.sub$Season)
+    se.sp.sub$Year <- as.factor(se.sp.sub$Year)
+    se.sp.sub$SiteYear <- as.factor(paste0(se.sp.sub$SiteCluster, se.sp.sub$Year))
+    
+    # Cover values are often very similar, especially for very small plants. Add tiny random numbers to Cover values so that models will run properly
+    se.sp.sub$Cover <- se.sp.sub$Cover + 
+      rnorm(length(se.sp.sub$Cover), 0, 0.00001)
+          
+    # Print Season
+    ifelse(unique(se.sp.sub$Season) == 2, 
+           ssn.name <- "spring", 
+           ssn.name <- "fall")
+    cat("  \n\n#### Season:", ssn.name)
+    cat("  \n ")
+
+    total.samples <- dim(se.sp.sub)[1]
+    
+    # If there are fewer than 10 samples or less than 3 site-years sampled, discontinue analysis and skip to next species-season
+    if (length(!is.na(se.sp.sub$Live_Weight)) < 10 | dim(unique(se.sp.sub[,c("Year", "SiteYear", "SiteCluster", "Treatment")]))[1] < 3) next
+    
+
+    ### Climate-invariant models
+    # First, determine if allometries differ based on years since burn
+    # If yes, exclude "burn treatment" samples from further analysis
+    # If no, include "burn treatment" samples
+    burn.answer <- "n"
+    burn.pval <- NA
+    # Create list of model covariates for this species
+    all.covariates <- unique(se.sp.sub[,c("Year", "SiteYear", "SiteCluster", "Treatment")])
+    trt.cov <- unique(se.sp.sub[,c("Year", "Treatment")])
+    
+    if # require at least 10 samples from burn plots 
+    (length(unique(se.sp.sub$Treatment)) > 1 &
+     length(se.sp.sub$Treatment[se.sp.sub$Treatment == "B"]) > 10) {
+      cat("  \n***Fire effects***:\n")
+      
+      # Model: Live_Weight ~ 0 + Year + Volume*SinceBurn
+      
+       if # require each treatment to have been sampled twice
+      (length(trt.cov$Treatment[trt.cov$Treatment=="C"]) > 1 &
+       length(trt.cov$Treatment[trt.cov$Treatment=="B"]) > 1 &
+       # require each treatment to have been sampled in overlapping years
+       sum(unique(all.covariates$Year[all.covariates$Treatment=="C"]) %in%
+           unique(all.covariates$Year[all.covariates$Treatment=="B"])) > 0) {
+        burn.pval <- round(anova(gls(Live_Weight ~ 0 + Year + Volume*SinceBurn, data=se.sp.sub[se.sp.sub$Site == "L",], na.action = na.exclude, control=list(singular.ok=T)))["Volume:SinceBurn", "p-value"], 2)
+        
+        if (!is.na(burn.pval) & burn.pval < 0.05) {
+          burn.answer == "y"
+          cat("There *are* significant interactions with fire on this species' allometry (Volume:SinceBurn p-value =", burn.pval,"). Observations from burned sites are excluded from further analysis.")
+          visreg2d(lm(Live_Weight ~ 0 + Year + Volume*SinceBurn, data=se.sp.sub[se.sp.sub$Site == "L",], na.action = na.exclude), 
+                   xvar="Volume", yvar="SinceBurn", type="conditional", 
+                   col =  visreg.colors,
+                   zlim = c(0,max(se.sp.sub$Live_Weight[se.sp.sub$Site == "L"], na.rm=T)),
+                   cex = 0.7, cex.main = 0.7, cex.axis = 0.7, cex.sub = 0.7)
+se.sp.sub <- se.sp.sub[se.sp.sub$Treatment != "B",]
+        }}
+        if(!is.na(burn.pval) & burn.pval >= 0.05) {
+          cat("There are *not* significant interactions with fire on this species' allometry (Volume:SinceBurn p-value =", burn.pval,"). Observations from burned sites are included in further analysis. \n") }}
+    
+    # Determine year- and site- invariant regression
+
+    # Create list of model covariates for this species
+    all.covariates <- unique(se.sp.sub[,c("Year", "SiteYear", "SiteCluster")])
+    # Reset model null values
+    all.yr.vol.model <- all.yr.cov.model <- NULL
+    all.yr.AIC.vol <- all.yr.AIC.cov <- 999999999
+    all.yr.main.vol <- all.yr.main.cov <- NA
+    all.yr.main.p.vol <- all.yr.main.p.cov <- NA    
+    
+    all.yr.samp <- length(!is.na(se.sp.sub$Live_Weight))
+    all.clim.years <- dim(all.covariates)[1]
+    
+    # Create invariant models
+    if # require ten samples
+    (length(!is.na(se.sp.sub$Live_Weight)) >= 10) {
+      all.yr.vol.gls <- gls(Live_Weight ~ 0 + Volume, data = se.sp.sub, na.action = na.exclude)
+      all.yr.vol.model <- anova(all.yr.vol.gls, type="marginal") 
+      all.yr.main.vol <- all.yr.vol.gls$coefficients[1]
+      all.yr.main.p.vol <- all.yr.vol.model["Volume", "p-value"]
+      all.yr.AIC.vol <- AIC(all.yr.vol.gls)
+
+      all.yr.cov.gls <- gls(Live_Weight ~ 0 + Cover, data = se.sp.sub, na.action = na.exclude)
+      all.yr.cov.model <- anova(all.yr.cov.gls, type="marginal") 
+      all.yr.main.cov <- all.yr.cov.gls$coefficients[1]
+      all.yr.main.p.cov <- all.yr.cov.model["Cover", "p-value"]
+      all.yr.AIC.cov <- AIC(all.yr.cov.gls)
+    }
+    
+    
+    ### Site specific model
+    
+    # Create list of covariates possible for this species
+    site.covariates <- unique(se.sp.sub[,c("Year", "SiteYear", "SiteCluster")])
+    site.covariates <- ddply(site.covariates, "SiteCluster", function(x) data.frame(num.yrs = length(x$Year)))    
+    # Reset model null values
+    site.vol.model <- site.cov.model <- NULL
+    site.main.vol <- site.main.cov <- NA
+    site.main.p.vol  <- site.main.p.cov <- NA
+    site.inter.p.vol <- site.inter.p.cov <- NA    
+    site.AIC.vol <- site.AIC.cov <- 999999999
+
+    site.samp <- length(!is.na(se.sp.sub$Live_Weight))
+    site.clim.years <- dim(site.covariates)[1]
+    
+    if # require 2 sites to be sampled. Otherwise skip to climate models
+    (length(unique(se.sp.sub$SiteCluster[se.sp.sub$SiteCluster %in% site.covariates$SiteCluster[site.covariates$num.yrs >= 2]])) >= 2) {
+      site.vol.gls <- gls(Live_Weight ~ 0 + Volume + SiteCluster, data = se.sp.sub, na.action = na.exclude)
+      site.vol.model <- anova(site.vol.gls, type="marginal") 
+      site.main.vol <- site.vol.gls$coefficients["Volume"]
+      site.main.p.vol <- site.vol.model["Volume", "p-value"]
+      site.inter.p.vol <- site.vol.model["SiteCluster", "p-value"]
+      site.AIC.vol <- AIC(site.vol.gls)
+
+      site.cov.gls <- gls(Live_Weight ~ 0 + Cover + SiteCluster, data = se.sp.sub, na.action = na.exclude)
+      site.cov.model <- anova(site.cov.gls, type="marginal") 
+      site.main.cov <- site.cov.gls$coefficients["Cover"]
+      site.main.p.cov <- site.cov.model["Cover", "p-value"]
+      site.inter.p.cov <- site.cov.model["SiteCluster", "p-value"]
+      site.AIC.cov <- AIC(site.cov.gls)
+    }
+    
+    
+    siteyr.samp <- NA
+    siteyr.clim.years <- NA
+    
+    siteyear.vol.model <- siteyear.cov.model <- NULL
+    siteyr.main.vol <- siteyr.main.cov <- NA
+    siteyr.main.p.vol <- siteyr.main.p.cov <- NA
+    siteyr.inter.p.vol <- siteyr.inter.p.cov <- NA
+    siteyr.AIC.vol <- siteyr.AIC.cov <- NA
+    
+    ### Climate models
+    
+    # Create null climate models. Need results for z-scored and raw climate variables as well as cover-based models
+    spei6.model <- zspei6.model <- 
+      spei6.cov.model <- zspei6.cov.model <- 
+      gdd.model <- zgdd.model <- 
+      gdd.cov.model <- zgdd.cov.model <- 
+      precip.model <- zprecip.model <- 
+      precip.cov.model <- zprecip.cov.model <- NULL
+    
+    spei.main.vol <- zspei.main.vol <- 
+      spei.main.cov <- spei.main.cov <-
+      gdd.main.vol <- zgdd.main.vol <- 
+      gdd.main.cov <- gdd.main.cov <-
+      precip.main.vol <- zprecip.main.vol <- 
+      precip.main.cov <- precip.main.cov <- NA
+    spei.main.p.vol <- zspei.main.p.vol <- 
+      spei.main.p.cov <- spei.main.p.cov <- 
+      gdd.main.p.vol <- zgdd.main.p.vol <- 
+      gdd.main.p.cov <- gdd.main.p.cov <- 
+      precip.main.p.vol <- zprecip.main.p.vol <- 
+      precip.main.p.cov <- precip.main.p.cov <- NA
+    
+    spei.mainclim.vol <- zspei.mainclim.vol <- 
+      spei.mainclim.cov <- zspei.mainclim.cov <-
+      gdd.mainclim.vol <- zgdd.mainclim.vol <- 
+      gdd.mainclim.cov <- zgdd.mainclim.cov <-
+      precip.mainclim.vol <- zprecip.mainclim.vol <- 
+      precip.mainclim.cov <- zprecip.mainclim.cov <- NA
+    spei.mainclim.p.vol <- zspei.mainclim.p.vol <- 
+      spei.mainclim.p.cov <- zspei.mainclim.p.cov <- 
+      gdd.mainclim.p.vol <- zgdd.mainclim.p.vol <- 
+      gdd.mainclim.p.cov <- zgdd.mainclim.p.cov <- 
+      precip.mainclim.p.vol <- zprecip.mainclim.p.vol <- 
+      precip.mainclim.p.cov <- zprecip.mainclim.p.cov <- NA
+    
+    spei.inter.vol <- zspei.inter.vol <- spei.inter.cov <- 
+      gdd.inter.vol <- zgdd.inter.vol <- gdd.inter.cov <- 
+      precip.inter.vol <- zprecip.inter.vol <- precip.inter.cov <- NA
+    spei.inter.p.vol <- zspei.inter.p.vol <- spei.inter.p.cov <- 
+      gdd.inter.p.vol <- zgdd.inter.p.vol <- gdd.inter.p.cov <- 
+      precip.inter.p.vol <- zprecip.inter.p.vol <- precip.inter.p.cov <- NA 
+    spei.AIC.vol <- zspei.AIC.vol <- 
+      spei.AIC.cov <- zspei.AIC.cov <- 
+      gdd.AIC.vol <- zgdd.AIC.vol <- 
+      gdd.AIC.cov <- zgdd.AIC.cov <- 
+      precip.AIC.vol <- zprecip.AIC.vol <- 
+      precip.AIC.cov <- zprecip.AIC.cov <- 999999999
+    
+    # Reset all-year and site model null values
+    all.yr.vol.model.sub <- all.yr.cov.model.sub <- NULL
+    all.yr.AIC.vol.sub <- all.yr.AIC.cov.sub <- 999999999
+    all.yr.main.vol.sub <- all.yr.main.cov.sub <- NA
+    all.yr.main.p.vol.sub <- all.yr.main.p.cov.sub <- NA
+    
+    site.vol.model.sub <- site.cov.model.sub <- NULL
+    site.main.vol.sub <- site.main.cov.sub <- NA
+    site.main.p.vol.sub  <- site.main.p.cov.sub <- NA
+    site.inter.p.vol.sub <- site.inter.p.cov.sub <- NA    
+    site.AIC.vol.sub <- site.AIC.cov.sub <- 999999999
+    
+    var.samp <- NA
+    var.clim.years <- NA
+     
+    # If there are at least 10 samples and 2 site-years
+    # calculate each site-year's regression
+    if (length(!is.na(se.sp.sub$Live_Weight)) >= 10 & 
+        length(unique(se.sp.sub[,"SiteYear"])) >= 2) {
+    
+    # Calculate regressions for each site-year
+    annual.model.sub <- unique(se.sp.sub[,c("kartez", "SiteCluster", "SiteYear", "Season", "z.6SPEI", "z.GDD", "z.precip", "SPEI6.thornth", "GDD", "season.precip")])
+    annual.model.sub$lm.vol.slope <- 
+      annual.model.sub$lm.cov.slope <-
+      annual.model.sub$lm.vol.rsquare <- 
+      annual.model.sub$lm.cov.rsquare <-
+      annual.model.sub$lm.vol.p <- 
+      annual.model.sub$lm.cov.p <- NA
+    for (siteyear in 1:length(unique(annual.model.sub$SiteYear))) {
+      this.siteyear <- unique(annual.model.sub$SiteYear)[siteyear]
+      # skip if there aren't at least two samples for this site-year
+      if (length(se.sp.sub[!is.na(se.sp.sub$SiteYear) & 
+                           se.sp.sub$SiteYear == this.siteyear,]) < 2) next
+      # Create volumetric model for each year
+      next.vol.model <- lm(
+        Live_Weight ~ 0 + Volume,
+        data=se.sp.sub[se.sp.sub$SiteYear == this.siteyear,])
+      annual.model.sub$lm.vol.slope[siteyear] <- next.vol.model$coef
+      annual.model.sub$lm.vol.rsquare[siteyear] <- 
+        summary(next.vol.model)$r.squared
+      annual.model.sub$lm.vol.p[siteyear] <- 
+        summary(next.vol.model)$coefficients[4]
+      # Create cover model for each year
+      next.cov.model <- lm(
+        Live_Weight ~ 0 + Cover,
+        data=se.sp.sub[se.sp.sub$SiteYear == this.siteyear,])
+      annual.model.sub$lm.cov.slope[siteyear] <- next.cov.model$coef
+      annual.model.sub$lm.cov.rsquare[siteyear] <- 
+        summary(next.cov.model)$r.squared
+      annual.model.sub$lm.cov.p[siteyear] <- 
+        summary(next.cov.model)$coefficients[4]
+      # sample size is minimum number of UNIQUE volume OR cover measurements, not raw sample size
+      annual.model.sub$samp.size[siteyear] <- min(length(!is.na(unique(se.sp.sub$Live_Weight[se.sp.sub$SiteYear == this.siteyear]))),
+      length(!is.na(unique(se.sp.sub$Volume[se.sp.sub$SiteYear == this.siteyear]))))
+    }
+    
+    # Exclude SiteYears with really poor allometric fits
+    se.sp.sub <- se.sp.sub[se.sp.sub$SiteYear %in% annual.model.sub$SiteYear[(annual.model.sub$lm.vol.rsquare > 0.25 & annual.model.sub$lm.cov.rsquare > 0.25)],]
+    # or not enough data
+    se.sp.sub <- se.sp.sub[se.sp.sub$SiteYear %in% annual.model.sub$SiteYear[annual.model.sub$samp.size >= 3],]
+    
+    
+    # Create list of remaining climate covariates 
+    SPEI.covariates <- unique(se.sp.sub[,c("Year", "SiteCluster", "SiteYear", "SPEI6.thornth", "z.6SPEI")])
+    GDD.covariates <- unique(se.sp.sub[,c("Year", "SiteCluster", "SiteYear", "GDD", "z.GDD")])
+    precip.covariates <- unique(se.sp.sub[,c("Year", "SiteCluster", "SiteYear", "season.precip", "z.precip")])
+    
+    # For climate models, subset to only the years that have full GDD, SPEI, and precip data
+    se.sp.sub <- se.sp.sub[
+      se.sp.sub$SiteYear %in% SPEI.covariates$SiteYear[!is.na(SPEI.covariates$z.6SPEI)] &
+        se.sp.sub$SiteYear %in% GDD.covariates$SiteYear[!is.na(GDD.covariates$z.GDD)] &
+        se.sp.sub$SiteYear %in% precip.covariates$SiteYear[!is.na(precip.covariates$z.precip)], ]
+    
+    var.samp <- dim(se.sp.sub)[1]
+    var.clim.years <- length(unique(se.sp.sub$SiteYear))
+    
+      # Test Volume:SiteYear interaction
+    # If this has a positive result, we have evidence (and enough samples to assess) that interannual and spatial variation in climate might be driving differences in allometries
+    # If there are at least 10 samples and 2 site-years
+    # calculate each site-year's regression
+    if (length(!is.na(se.sp.sub$Live_Weight)) >= 10 & 
+        length(unique(se.sp.sub[,"SiteYear"])) >= 2) {
+      siteyr.samp <- dim(se.sp.sub)[1]
+      siteyr.clim.years <- length(unique(se.sp.sub$SiteYear))
+      
+      siteyear.vol.gls <- gls(Live_Weight ~ 0 + Volume*SiteYear, data = se.sp.sub, na.action = na.exclude)
+      siteyear.vol.model <- anova(siteyear.vol.gls, type="marginal") 
+      siteyr.main.vol <- siteyear.vol.gls$coefficients["Volume"]
+      siteyr.main.p.vol <- siteyear.vol.model["Volume", "p-value"]
+      siteyr.inter.p.vol <- siteyear.vol.model["Volume:SiteYear", "p-value"]
+      siteyr.AIC.vol <- AIC(siteyear.vol.gls)
+      
+      siteyear.cov.gls <- gls(Live_Weight ~ 0 + Cover*SiteYear, data = se.sp.sub, na.action = na.exclude)
+      siteyear.cov.model <- anova(siteyear.cov.gls, type="marginal") 
+      siteyr.main.cov <- siteyear.cov.gls$coefficients["Cover"]
+      siteyr.main.p.cov <- siteyear.cov.model["Cover", "p-value"]
+      siteyr.inter.p.cov <- siteyear.cov.model["Cover:SiteYear", "p-value"]
+      siteyr.AIC.cov <- AIC(siteyear.vol.gls)
+    
+      
+      # If all three climate variables can't be compared, discontinue the rest of this analysis
+      if (length(!is.na(SPEI.covariates$z.6SPEI)) > 2 &
+          length(!is.na(GDD.covariates$z.GDD)) > 2 &
+          length(!is.na(precip.covariates$z.precip)) > 2) {
+      
+    
+        # SPEI-6 month model
+        spei6.gls <- gls(Live_Weight ~ 0 + Volume*SPEI6.thornth, data = se.sp.sub, na.action = na.exclude)
+        spei6.model <- anova(spei6.gls, type="marginal") 
+        spei.main.vol <- spei6.gls$coefficients[1]
+        spei.main.p.vol <- spei6.model["Volume", "p-value"]
+        spei.mainclim.vol <- spei6.gls$coefficients[2]
+        spei.mainclim.p.vol <- spei6.model["SPEI6.thornth", "p-value"]
+        spei.inter.vol <- spei6.gls$coefficients[3]
+        spei.inter.p.vol <- spei6.model["Volume:SPEI6.thornth", "p-value"]
+        spei.AIC.vol <- AIC(spei6.gls)
+        
+        zspei6.gls <- gls(Live_Weight ~ 0 + Volume*z.6SPEI, data = se.sp.sub, na.action = na.exclude)
+        zspei6.model <- anova(zspei6.gls, type="marginal") 
+        zspei.main.vol <- zspei6.gls$coefficients[1]
+        zspei.main.p.vol <- zspei6.model["Volume", "p-value"]
+        zspei.mainclim.vol <- zspei6.gls$coefficients[2]
+        zspei.mainclim.p.vol <- zspei6.model["z.6SPEI", "p-value"]
+        zspei.inter.vol <- zspei6.gls$coefficients[3]
+        zspei.inter.p.vol <- zspei6.model["Volume:z.6SPEI", "p-value"]
+        zspei.AIC.vol <- AIC(zspei6.gls)
+        
+        spei6.cov.gls <- gls(Live_Weight ~ 0 + Cover*SPEI6.thornth, data = se.sp.sub, na.action = na.exclude)
+        spei6.cov.model <- anova(spei6.cov.gls, type="marginal") 
+        spei.main.cov <- spei6.cov.gls$coefficients[1]
+        spei.main.p.cov <- spei6.cov.model["Cover", "p-value"]
+        spei.mainclim.cov <- spei6.cov.gls$coefficients[2]
+        spei.mainclim.p.cov <- spei6.cov.model["SPEI6.thornth", "p-value"]
+        spei.inter.cov <- spei6.cov.gls$coefficients[3]
+        spei.inter.p.cov <- spei6.cov.model["Cover:SPEI6.thornth", "p-value"]
+        spei.AIC.cov <- AIC(spei6.cov.gls)
+        
+        zspei6.cov.gls <- gls(Live_Weight ~ 0 + Cover*z.6SPEI, data = se.sp.sub, na.action = na.exclude)
+        zspei6.cov.model <- anova(zspei6.cov.gls, type="marginal") 
+        zspei.main.cov <- zspei6.cov.gls$coefficients[1]
+        zspei.main.p.cov <- zspei6.cov.model["Cover", "p-value"]
+        zspei.mainclim.cov <- zspei6.cov.gls$coefficients[2]
+        zspei.mainclim.p.cov <- zspei6.cov.model["z.6SPEI", "p-value"]
+        zspei.inter.cov <- zspei6.cov.gls$coefficients[3]
+        zspei.inter.p.cov <- zspei6.cov.model["Cover:z.6SPEI", "p-value"]
+        zspei.AIC.cov <- AIC(zspei6.cov.gls)
+        
+        
+        # GDD model
+        gdd.gls <- gls(Live_Weight ~ 0 + Volume*GDD, data = se.sp.sub, na.action = na.exclude)
+        gdd.model <- anova(gdd.gls, type="marginal") 
+        gdd.main.vol <- gdd.gls$coefficients[1]
+        gdd.main.p.vol <- gdd.model["Volume", "p-value"]
+        gdd.mainclim.vol <- gdd.gls$coefficients[2]
+        gdd.mainclim.p.vol <- gdd.model["GDD", "p-value"]
+        gdd.inter.vol <- gdd.gls$coefficients[3]
+        gdd.inter.p.vol <- gdd.model["Volume:GDD", "p-value"]
+        gdd.AIC.vol <- AIC(gdd.gls) 
+        
+        zgdd.gls <- gls(Live_Weight ~ 0 + Volume*z.GDD, data = se.sp.sub, na.action = na.exclude)
+        zgdd.model <- anova(zgdd.gls, type="marginal") 
+        zgdd.main.vol <- zgdd.gls$coefficients[1]
+        zgdd.main.p.vol <- zgdd.model["Volume", "p-value"]
+        zgdd.mainclim.vol <- zgdd.gls$coefficients[2]
+        zgdd.mainclim.p.vol <- zgdd.model["z.GDD", "p-value"]
+        zgdd.inter.vol <- zgdd.gls$coefficients[3]
+        zgdd.inter.p.vol <- zgdd.model["Volume:z.GDD", "p-value"]
+        zgdd.AIC.vol <- AIC(zgdd.gls)  
+        
+        gdd.cov.gls <- gls(Live_Weight ~ 0 + Cover*GDD, data = se.sp.sub, na.action = na.exclude)
+        gdd.cov.model <- anova(gdd.cov.gls, type="marginal") 
+        gdd.main.cov <- gdd.cov.gls$coefficients[1]
+        gdd.main.p.cov <- gdd.cov.model["Cover", "p-value"]
+        gdd.mainclim.cov <- gdd.cov.gls$coefficients[2]
+        gdd.mainclim.p.cov <- gdd.cov.model["GDD", "p-value"]
+        gdd.inter.cov <- gdd.cov.gls$coefficients[3]
+        gdd.inter.p.cov <- gdd.cov.model["Cover:GDD", "p-value"]
+        gdd.AIC.cov <- AIC(gdd.cov.gls) 
+        
+        zgdd.cov.gls <- gls(Live_Weight ~ 0 + Cover*z.GDD, data = se.sp.sub, na.action = na.exclude)
+        zgdd.cov.model <- anova(zgdd.cov.gls, type="marginal") 
+        zgdd.main.cov <- zgdd.cov.gls$coefficients[1]
+        zgdd.main.p.cov <- zgdd.cov.model["Cover", "p-value"]
+        zgdd.mainclim.cov <- zgdd.cov.gls$coefficients[2]
+        zgdd.mainclim.p.cov <- zgdd.cov.model["z.GDD", "p-value"]
+        zgdd.inter.cov <- zgdd.cov.gls$coefficients[3]
+        zgdd.inter.p.cov <- zgdd.cov.model["Cover:z.GDD", "p-value"]
+        zgdd.AIC.cov <- AIC(zgdd.cov.gls) 
+        
+        # precip model 
+        precip.gls <- gls(Live_Weight ~ 0 + Volume*season.precip, data = se.sp.sub, na.action = na.exclude)
+        precip.model <- anova(precip.gls, type="marginal") 
+        precip.main.vol <- precip.gls$coefficients[1]
+        precip.main.p.vol <- precip.model["Volume", "p-value"]
+        precip.mainclim.vol <- precip.gls$coefficients[2]
+        precip.mainclim.p.vol <- precip.model["season.precip", "p-value"]        
+        precip.inter.vol <- precip.gls$coefficients[3]
+        precip.inter.p.vol <- precip.model["Volume:season.precip", "p-value"]
+        precip.AIC.vol <- AIC(precip.gls) 
+        
+        zprecip.gls <- gls(Live_Weight ~ 0 + Volume*z.precip, data = se.sp.sub, na.action = na.exclude)
+        zprecip.model <- anova(zprecip.gls, type="marginal") 
+        zprecip.main.vol <- zprecip.gls$coefficients[1]
+        zprecip.main.p.vol <- zprecip.model["Volume", "p-value"]
+        zprecip.mainclim.vol <- zprecip.gls$coefficients[2]
+        zprecip.mainclim.p.vol <- zprecip.model["z.precip", "p-value"]
+        zprecip.inter.vol <- zprecip.gls$coefficients[3]
+        zprecip.inter.p.vol <- zprecip.model["Volume:z.precip", "p-value"]
+        zprecip.AIC.vol <- AIC(zprecip.gls) 
+        
+        precip.cov.gls <- gls(Live_Weight ~ 0 + Cover*season.precip, data = se.sp.sub, na.action = na.exclude)
+        precip.cov.model <- anova(precip.cov.gls, type="marginal") 
+        precip.main.cov <- precip.cov.gls$coefficients[1]
+        precip.main.p.cov <- precip.cov.model["Cover", "p-value"]
+        precip.mainclim.cov <- precip.cov.gls$coefficients[2]
+        precip.mainclim.p.cov <- precip.cov.model["season.precip", "p-value"]
+        precip.inter.cov <- precip.cov.gls$coefficients[3]
+        precip.inter.p.cov <- precip.cov.model["Cover:season.precip", "p-value"]
+        precip.AIC.cov <- AIC(precip.cov.gls)
+        
+        zprecip.cov.gls <- gls(Live_Weight ~ 0 + Cover*z.precip, data = se.sp.sub, na.action = na.exclude)
+        zprecip.cov.model <- anova(zprecip.cov.gls, type="marginal") 
+        zprecip.main.cov <- zprecip.cov.gls$coefficients[1]
+        zprecip.main.p.cov <- zprecip.cov.model["Cover", "p-value"]
+        zprecip.mainclim.cov <- zprecip.cov.gls$coefficients[2]
+        zprecip.mainclim.p.cov <- zprecip.cov.model["z.precip", "p-value"]        
+        zprecip.inter.cov <- zprecip.cov.gls$coefficients[3]
+        zprecip.inter.p.cov <- zprecip.cov.model["Cover:z.precip", "p-value"]
+        zprecip.AIC.cov <- AIC(zprecip.cov.gls)
+   
+    
+        
+        # Re-create invariant models with same sample size as climate models
+        all.yr.vol.gls.sub <- gls(Live_Weight ~ 0 + Volume, data = se.sp.sub, na.action = na.exclude)
+        all.yr.vol.model.sub <- anova(all.yr.vol.gls.sub, type="marginal") 
+        all.yr.main.vol.sub <- all.yr.vol.gls.sub$coefficients[1]
+        all.yr.main.p.vol.sub <- all.yr.vol.model.sub["Volume", "p-value"]
+        all.yr.AIC.vol.sub <- AIC(all.yr.vol.gls.sub)
+        
+        all.yr.cov.gls.sub <- gls(Live_Weight ~ 0 + Cover, data = se.sp.sub, na.action = na.exclude)
+        all.yr.cov.model.sub <- anova(all.yr.cov.gls.sub, type="marginal") 
+        all.yr.main.cov.sub <- all.yr.cov.gls.sub$coefficients[1]
+        all.yr.main.p.cov.sub <- all.yr.cov.model.sub["Cover", "p-value"]
+        all.yr.AIC.cov.sub <- AIC(all.yr.cov.gls.sub)
+        
+        
+        
+        # Re-create site specific models if there are 2 site-years
+        site.covariates <- unique(se.sp.sub[,c("Year", "SiteYear", "SiteCluster")])
+        site.covariates <- ddply(site.covariates, "SiteCluster", function(x) data.frame(num.yrs = length(x$Year)))
+        
+        if (length(unique(se.sp.sub$SiteCluster[se.sp.sub$SiteCluster %in% site.covariates$SiteCluster[site.covariates$num.yrs >= 2]])) >= 2) {
+          site.vol.gls.sub <- gls(Live_Weight ~ 0 + Volume + SiteCluster, data = se.sp.sub, na.action = na.exclude)
+          site.vol.model.sub <- anova(site.vol.gls.sub, type="marginal") 
+          site.main.vol.sub <- site.vol.gls.sub$coefficients["Volume"]
+          site.main.p.vol.sub <- site.vol.model.sub["Volume", "p-value"]
+          site.inter.p.vol.sub <- site.vol.model.sub["SiteCluster", "p-value"]
+          site.AIC.vol.sub <- AIC(site.vol.gls.sub)
+          
+          site.cov.gls.sub <- gls(Live_Weight ~ 0 + Cover + SiteCluster, data = se.sp.sub[se.sp.sub$SiteCluster %in% site.covariates$SiteCluster[site.covariates$num.yrs >= 2],], na.action = na.exclude)
+          site.cov.model.sub <- anova(site.cov.gls.sub, type="marginal") 
+          site.main.cov.sub <- site.cov.gls.sub$coefficients["Cover"]
+          site.main.p.cov.sub <- site.cov.model.sub["Cover", "p-value"]
+          site.inter.p.cov.sub <- site.cov.model.sub["SiteCluster", "p-value"]
+          site.AIC.cov.sub <- AIC(site.cov.gls.sub)
+        }
+    
+        # Raw data plots
+        clim.lim.ssn <- clim.limits[clim.limits$Season == unique(se.sp.sub$Season),]
+        
+    SPEIslope.vol.fig <- ggplot(data = annual.model.sub[annual.model.sub$SiteYear %in% se.sp.sub$SiteYear,], aes(x = SPEI6.thornth, y = lm.vol.slope)) +
+      theme_cowplot(font_size = 8) + 
+      xlab('SPEI_6mo') + ylab('volume:weight') + 
+      geom_point(alpha=0.75, aes(size=lm.vol.rsquare, colour = SiteCluster, fill = SiteCluster, shape = SiteCluster), show.legend = F) + 
+      stat_smooth(method = "lm", se=F, colour = "black") +     
+      scale_fill_manual(name = "Site Cluster", values = SiteCluster.colors) + scale_colour_manual(name = "Site Cluster", values = SiteCluster.colors) +
+      scale_shape_manual(name = "Site Cluster", values = SiteCluster.shapes) +
+      scale_size(limits = c(0.25, 1)) +
+      xlim(clim.lim.ssn$min.SPEI, clim.lim.ssn$max.SPEI)
+
+    SPEIslope.cov.fig <- ggplot(data = annual.model.sub[annual.model.sub$SiteYear %in% se.sp.sub$SiteYear,], aes(x = SPEI6.thornth, y = lm.cov.slope)) +
+      theme_cowplot(font_size = 8) + 
+      xlab('SPEI_6mo') + ylab('cover:weight') + 
+      geom_point(alpha=0.8, aes(size=lm.cov.rsquare, colour = SiteCluster, fill = SiteCluster, shape = SiteCluster), show.legend = F) + 
+      stat_smooth(method = "lm", se=F, colour = "black") +     
+      scale_fill_manual(name = "Site Cluster", values = SiteCluster.colors) + scale_colour_manual(name = "Site Cluster", values = SiteCluster.colors) +
+      scale_shape_manual(name = "Site Cluster", values = SiteCluster.shapes) +
+      scale_size(limits = c(0.25, 1)) +
+      xlim(clim.lim.ssn$min.SPEI, clim.lim.ssn$max.SPEI)
+    
+    GDDslope.vol.fig <- ggplot(data = annual.model.sub[annual.model.sub$SiteYear %in% se.sp.sub$SiteYear,], aes(x = GDD, y = lm.vol.slope)) +
+      theme_cowplot(font_size = 8) + theme(axis.text.y = element_blank(), axis.title.y = element_blank()) + 
+      xlab('GDD') + ylab('volume:weight') + 
+      geom_point(alpha=0.8, aes(size=lm.vol.rsquare, colour = SiteCluster, fill = SiteCluster, shape = SiteCluster), show.legend = F) + 
+      stat_smooth(method = "lm", se=F, colour = "black") +     
+      scale_fill_manual(name = "Site Cluster", values = SiteCluster.colors) + scale_colour_manual(name = "Site Cluster", values = SiteCluster.colors) +
+      scale_shape_manual(name = "Site Cluster", values = SiteCluster.shapes) +
+      scale_size(limits = c(0.25, 1)) +
+      xlim(clim.lim.ssn$min.GDD, clim.lim.ssn$max.GDD)
+    
+    GDDslope.cov.fig <- ggplot(data = annual.model.sub[annual.model.sub$SiteYear %in% se.sp.sub$SiteYear,], aes(x = GDD, y = lm.cov.slope)) +
+      theme_cowplot(font_size = 8) + theme(axis.text.y = element_blank(), axis.title.y = element_blank()) + 
+      xlab('GDD') + ylab('cover:weight') + 
+      geom_point(alpha=0.8, aes(size=lm.cov.rsquare, colour = SiteCluster, fill = SiteCluster, shape = SiteCluster), show.legend = F) + 
+      stat_smooth(method = "lm", se=F, colour = "black") +     
+      scale_fill_manual(name = "Site Cluster", values = SiteCluster.colors) + scale_colour_manual(name = "Site Cluster", values = SiteCluster.colors) +
+      scale_shape_manual(name = "Site Cluster", values = SiteCluster.shapes) +
+      scale_size(limits = c(0.25, 1)) +
+      xlim(clim.lim.ssn$min.GDD, clim.lim.ssn$max.GDD)
+    
+    precipslope.vol.fig <- ggplot(data = annual.model.sub[annual.model.sub$SiteYear %in% se.sp.sub$SiteYear,], aes(x = season.precip, y = lm.vol.slope)) +
+      theme_cowplot(font_size = 8) + 
+      theme(axis.text.y = element_blank(), axis.title.y = element_blank(), legend.key.size = unit(0.7, "lines")) + 
+      xlab('precip') + ylab('volume:weight') + 
+      geom_point(alpha=0.8, aes(size=lm.vol.rsquare, colour = SiteCluster, fill = SiteCluster, shape = SiteCluster)) + 
+      stat_smooth(method = "lm", se=F, colour = "black") +     
+      scale_fill_manual(name = "Site Cluster", values = SiteCluster.colors) + scale_colour_manual(name = "Site Cluster", values = SiteCluster.colors) +
+      scale_shape_manual(name = "Site Cluster", values = SiteCluster.shapes) +
+      scale_size(name = "R\u00B2", limits = c(0.25, 1)) +
+      xlim(clim.lim.ssn$min.precip, clim.lim.ssn$max.precip)
+    
+    precipslope.cov.fig <- ggplot(data = annual.model.sub[annual.model.sub$SiteYear %in% se.sp.sub$SiteYear,], aes(x = season.precip, y = lm.cov.slope)) +
+      theme_cowplot(font_size = 8) + 
+      theme(axis.text.y = element_blank(), axis.title.y = element_blank(), legend.key.size = unit(0.7, "lines")) + 
+      xlab('precip') + ylab('cover:weight') + 
+      geom_point(alpha=0.8, aes(size=lm.cov.rsquare, colour = SiteCluster, fill = SiteCluster, shape = SiteCluster)) + 
+      stat_smooth(method = "lm", se=F, colour = "black") +     
+      scale_fill_manual(name = "Site Cluster", values = SiteCluster.colors) + scale_colour_manual(name = "Site Cluster", values = SiteCluster.colors) +
+      scale_shape_manual(name = "Site Cluster", values = SiteCluster.shapes) +
+      scale_size(name = "R\u00B2", limits = c(0.25, 1)) +
+      xlim(clim.lim.ssn$min.precip, clim.lim.ssn$max.precip)
+    
+     # Raw data plots
+    SPEI.vol.fig <- ggplot(data = se.sp.sub, 
+                       aes(x = Volume, y = Live_Weight)) +
+      theme_cowplot(font_size = 8) + 
+      ylim(0,max(se.sp.sub$Live_Weight, na.rm=T)) +
+      xlim(0,max(se.sp.sub$Volume, na.rm=T)) +
+      xlab('Volume') + ylab('Live_Weight') + 
+      geom_point(alpha=0.5, aes(colour = z.6SPEI, fill = z.6SPEI, shape = SiteCluster), show.legend = F) +
+      stat_smooth(aes(x = Volume, y = Live_Weight), method="lm", se=F, formula=y~0+x, colour = "black") + 
+      stat_smooth(aes(colour = z.6SPEI, group = z.6SPEI), method="lm", se=F, formula=y~0+x, show.legend = F) +
+      scale_shape_manual(values = SiteCluster.shapes) +
+      scale_color_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3)) +
+      scale_fill_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3))
+    
+    SPEI.cov.fig <- ggplot(data = se.sp.sub, 
+                           aes(x = Cover, y = Live_Weight)) +
+      theme_cowplot(font_size = 8) + 
+      ylim(0,max(se.sp.sub$Live_Weight, na.rm=T)) +
+      xlim(0,max(se.sp.sub$Cover, na.rm=T)) +
+      xlab('Cover') + ylab('Live_Weight') + 
+      geom_point(alpha=0.5, aes(colour = z.6SPEI, fill = z.6SPEI, shape = SiteCluster), show.legend = F) +
+      stat_smooth(aes(x = Cover, y = Live_Weight), method="lm", se=F, formula=y~0+x, colour = "black") + 
+      stat_smooth(aes(colour = z.6SPEI, group = SiteYear), method="lm", se=F, formula=y~0+x, show.legend = F) +
+      scale_shape_manual(values = SiteCluster.shapes) +
+      scale_color_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3)) +
+      scale_fill_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3))
+    
+    GDD.vol.fig <- ggplot(data = se.sp.sub, 
+                      aes(x = Volume, y = Live_Weight)) +
+      theme_cowplot(font_size = 8) + 
+      theme(axis.text.y = element_blank(), axis.title.y = element_blank(),
+            legend.position = "top") + 
+      ylim(0,max(se.sp.sub$Live_Weight, na.rm=T)) +
+      xlim(0,max(se.sp.sub$Volume, na.rm=T)) +
+      xlab('Volume') + ylab('Live_Weight') + 
+      geom_point(alpha=0.5, aes(colour = z.GDD, fill = z.GDD, shape = SiteCluster), show.legend = F) +
+      stat_smooth(aes(x = Volume, y = Live_Weight), method="lm", se=F, formula=y~0+x, colour = "black") + 
+      stat_smooth(aes(colour = z.GDD, group = SiteYear), method="lm", se=F, formula=y~0+x, show.legend = F) +
+      scale_shape_manual(values = SiteCluster.shapes) +
+      scale_color_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3)) +
+      scale_fill_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3))
+    
+    GDD.cov.fig <- ggplot(data = se.sp.sub, 
+                      aes(x = Cover, y = Live_Weight)) +
+      theme_cowplot(font_size = 8) + 
+      theme(axis.text.y = element_blank(), axis.title.y = element_blank(),
+            legend.position = "top") + 
+      ylim(0,max(se.sp.sub$Live_Weight, na.rm=T)) +
+      xlim(0,max(se.sp.sub$Cover, na.rm=T)) +
+      xlab('Cover') + ylab('Live_Weight') + 
+      geom_point(alpha=0.5, aes(colour = z.GDD, fill = z.GDD, shape = SiteCluster), show.legend = F) +
+      stat_smooth(aes(x = Cover, y = Live_Weight), method="lm", se=F, formula=y~0+x, colour = "black") + 
+      stat_smooth(aes(colour = z.GDD, group = SiteYear), method="lm", se=F, formula=y~0+x, show.legend = F) +
+      scale_shape_manual(values = SiteCluster.shapes) +
+      scale_color_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3)) +
+      scale_fill_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3))
+    
+    precip.vol.fig <- ggplot(data = se.sp.sub, 
+                         aes(x = Volume, y = Live_Weight)) +
+      theme_cowplot(font_size = 8) + 
+      theme(axis.text.y = element_blank(), axis.title.y = element_blank()) + 
+      guides(colour = guide_colorbar(title = "z-score")) +
+      ylim(0,max(se.sp.sub$Live_Weight, na.rm=T)) +
+      xlim(0,max(se.sp.sub$Volume, na.rm=T)) +
+      xlab('Volume') + ylab('Live_Weight') + 
+      geom_point(alpha=0.5, aes(colour = z.precip, fill = z.precip, shape = SiteCluster), show.legend = F) +
+      stat_smooth(aes(x = Volume, y = Live_Weight), method="lm", se=F, formula=y~0+x, colour = "black") + 
+      stat_smooth(aes(colour = z.precip, group = SiteYear), method="lm", se=F, formula=y~0+x) +
+      scale_shape_manual(values = SiteCluster.shapes) +
+      scale_color_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3)) +
+      scale_fill_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3))
+    
+    precip.cov.fig <- ggplot(data = se.sp.sub, 
+                         aes(x = Cover, y = Live_Weight)) +
+      theme_cowplot(font_size = 8) + 
+      theme(axis.text.y = element_blank(), axis.title.y = element_blank()) + 
+      guides(colour = guide_colorbar(title = "z-score")) +
+      ylim(0,max(se.sp.sub$Live_Weight, na.rm=T)) +
+      xlim(0,max(se.sp.sub$Cover, na.rm=T)) +
+      xlab('Cover') + ylab('Live_Weight') + 
+      geom_point(alpha=0.5, aes(colour = z.precip, fill = z.precip, shape = SiteCluster), show.legend = F) + 
+      stat_smooth(aes(x = Cover, y = Live_Weight), method="lm", se=F, formula=y~0+x, colour = "black") +      
+      stat_smooth(aes(colour = z.precip, group = SiteYear), method="lm", se=F, formula=y~0+x) +
+      scale_shape_manual(values = SiteCluster.shapes) +
+      scale_color_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3)) +
+      scale_fill_gradient2(low = "red", mid = "grey", high = "blue", limits=c(-3, 3))
+    
+    
+    # Print
+    plot.vol.left <- plot_grid(SPEI.vol.fig, SPEIslope.vol.fig, align = 'hv', nrow=2)
+    plot.vol.middle <- plot_grid(GDD.vol.fig, GDDslope.vol.fig, align = 'hv', nrow=2)
+    plot.vol.right <- plot_grid(precip.vol.fig, precipslope.vol.fig, align = 'hv', nrow=2)
+    plot.cov.left <- plot_grid(SPEI.cov.fig, SPEIslope.cov.fig, align = 'hv', nrow=2)
+    plot.cov.middle <- plot_grid(GDD.cov.fig, GDDslope.cov.fig, align = 'hv', nrow=2)
+    plot.cov.right <- plot_grid(precip.cov.fig, precipslope.cov.fig, align = 'hv', nrow=2)
+    
+    cat("  \n\nAnnual volume versus live weight slopes, as they relate to climate:\n\n")
+    print(plot_grid(plot.vol.left, plot.vol.middle, plot.vol.right, 
+                    align = 'hv', nrow=1, rel_widths = c(1.1,1,1.4)))
+    cat("  \n\nAnnual cover versus live weight slopes, as they relate to climate:\n\n")
+    print(plot_grid(plot.cov.left, plot.cov.middle, plot.cov.right, 
+                    align = 'hv', nrow=1, rel_widths = c(1.1,1,1.4)))
+    
+      }
+    }
+    }
+      
+    
+         # Write out file
+    new.output.line <- 
+      data.frame(
+        kartez = kartez,
+        genus = genus,
+        sp.epithet = sp.epithet,
+        family = family,
+        LifeHistory = a_p,
+        PhotoPath = path,
+        FunctionalGroup = g_f,
+        season = ssn.name,
+        total.samp = total.samples,
+        burn.excluded = burn.answer,
+        model = 
+          c('invar.vol', 'invar.cov',
+            'site.vol', 'site.cov',
+            'siteyr.vol', 'siteyr.cov',
+            'invar.vol.sub', 'invar.cov.sub',
+            'site.vol.sub', 'site.cov.sub',
+            'var.spei.vol', 'var.zspei.vol', 
+            'var.spei.cov', 'var.zspei.cov',
+            'var.gdd.vol', 'var.zgdd.vol', 
+            'var.gdd.cov', 'var.zgdd.cov',
+            'var.precip.vol', 'var.zprecip.vol', 
+            'var.precip.cov', 'var.zprecip.cov'),
+        model.samp = 
+          c(rep(all.yr.samp, 2),
+            rep(site.samp, 2),
+            rep(siteyr.samp, 2),
+            rep(var.samp, 16)),
+        clim.years = 
+          c(rep(all.clim.years, 2), 
+            rep(site.clim.years, 2),
+            rep(siteyr.clim.years, 2),
+            rep(var.clim.years, 16)),
+        main.eff = round(
+          c(all.yr.main.vol, all.yr.main.cov,
+            site.main.vol, site.main.cov,
+            siteyr.main.vol, siteyr.main.cov,
+            all.yr.main.vol.sub, all.yr.main.cov.sub,
+            site.main.vol.sub, site.main.cov.sub,
+            spei.main.vol, zspei.main.vol, 
+            spei.main.cov, zspei.main.cov,
+            gdd.main.vol, zgdd.main.vol, 
+            gdd.main.cov, zgdd.main.cov,
+            precip.main.vol, zprecip.main.vol, 
+            precip.main.cov, zprecip.main.cov), 3),
+        main.p = round(
+          c(all.yr.main.p.vol, all.yr.main.p.cov,
+            site.main.p.vol, site.main.p.cov,
+            siteyr.main.p.vol, siteyr.main.p.cov,
+            all.yr.main.p.vol.sub, all.yr.main.p.cov.sub,
+            site.main.p.vol.sub, site.main.p.cov.sub,
+            spei.main.p.vol, zspei.main.p.vol, 
+            spei.main.p.cov, zspei.main.p.cov,
+            gdd.main.p.vol, zgdd.main.p.vol, 
+            gdd.main.p.cov, zgdd.main.p.cov,
+            precip.main.p.vol, zprecip.main.p.vol, 
+            precip.main.p.cov, zprecip.main.p.cov), 3),
+        mainclim.eff = round(
+          c(NA, NA,
+            NA, NA,
+            NA, NA,
+            NA, NA,
+            NA, NA,
+            spei.mainclim.vol, zspei.mainclim.vol, 
+            spei.mainclim.cov, zspei.mainclim.cov,
+            gdd.mainclim.vol, zgdd.mainclim.vol, 
+            gdd.mainclim.cov, zgdd.mainclim.cov,
+            precip.mainclim.vol, zprecip.mainclim.vol, 
+            precip.mainclim.cov, zprecip.mainclim.cov), 3),
+        mainclim.p = round(
+          c(NA, NA,
+            NA, NA,
+            NA, NA,
+            NA, NA,
+            NA, NA,
+            spei.mainclim.p.vol, zspei.mainclim.p.vol, 
+            spei.mainclim.p.cov, zspei.mainclim.p.cov,
+            gdd.mainclim.p.vol, zgdd.mainclim.p.vol, 
+            gdd.mainclim.p.cov, zgdd.mainclim.p.cov,
+            precip.mainclim.p.vol, zprecip.mainclim.p.vol, 
+            precip.mainclim.p.cov, zprecip.mainclim.p.cov), 3),
+        inter.eff = round(
+          c(NA, NA,
+            NA, NA,
+            NA, NA,
+            NA, NA,
+            NA, NA,
+            spei.inter.vol, zspei.inter.vol, 
+            spei.inter.cov, zspei.inter.cov,
+            gdd.inter.vol, zgdd.inter.vol, 
+            gdd.inter.cov, zgdd.inter.cov,
+            precip.inter.vol, zprecip.inter.vol, 
+            precip.inter.cov, zprecip.inter.cov), 3),
+        inter.p = round(
+          c(NA, NA,
+            site.inter.p.vol, site.inter.p.cov,
+            siteyr.inter.p.vol, siteyr.inter.p.cov,
+            NA, NA,
+            site.inter.p.vol.sub, site.inter.p.cov.sub,
+            spei.inter.p.vol, zspei.inter.p.vol, 
+            spei.inter.p.cov, zspei.inter.p.cov,
+            gdd.inter.p.vol, zgdd.inter.p.vol, 
+            gdd.inter.p.cov, zgdd.inter.p.cov,
+            precip.inter.p.vol, zprecip.inter.p.vol, 
+            precip.inter.p.cov, zprecip.inter.p.cov), 3),
+        AIC = round(
+          c(all.yr.AIC.vol, all.yr.AIC.cov,
+            site.AIC.vol, site.AIC.cov,
+            siteyr.AIC.vol, siteyr.AIC.cov,
+            all.yr.AIC.vol.sub, all.yr.AIC.cov.sub,
+            site.AIC.vol.sub, site.AIC.cov.sub,
+            spei.AIC.vol, zspei.AIC.vol, 
+            spei.AIC.cov, zspei.AIC.cov,
+            gdd.AIC.vol, zgdd.AIC.vol, 
+            gdd.AIC.cov, zgdd.AIC.cov,
+            precip.AIC.vol, zprecip.AIC.vol, 
+            precip.AIC.cov, zprecip.AIC.cov), 2))
+    
+    new.output.line$AIC[new.output.line$AIC >= 999999999] <- NA
+    
+    # Make model names more intelligible 
+    new.output.line$model.name <- revalue(new.output.line$model, c(
+      "invar.vol" = "Volume",
+      "invar.cov" = "Cover",
+      "site.vol" = "Volume+Site",
+      "site.cov" = "Cover+Site",
+      "siteyr.vol" = "Volume+SiteYear",
+      "siteyr.cov" = "Cover+SiteYear",
+      "invar.vol.sub" = "Volume",
+      "invar.cov.sub" = "Cover",
+      "site.vol.sub" = "Volume+Site",
+      "site.cov.sub" = "Cover+Site",
+      "var.spei.vol" = "Volume*SPEI",
+      "var.zspei.vol" = "Volume*zSPEI",
+      "var.spei.cov" = "Cover*SPEI",
+      "var.zspei.cov" = "Cover*zSPEI",
+      "var.gdd.vol" = "Volume*GDD",
+      "var.zgdd.vol" = "Volume*zGDD",
+      "var.gdd.cov" = "Cover*GDD",
+      "var.zgdd.cov" = "Cover*zGDD",
+      "var.precip.vol" = "Volume*precip",
+      "var.zprecip.vol" = "Volume*zprecip",
+      "var.precip.cov" = "Cover*precip",
+      "var.zprecip.cov" = "Cover*zprecip"
+    ))
+    
+    # Print decision making table
+    decision.table <- new.output.line[
+      new.output.line$model %in% c('siteyr.vol', 'siteyr.cov', 'invar.vol.sub', 'invar.cov.sub', 'site.vol.sub', 'site.cov.sub', 'var.zspei.vol', 'var.zspei.cov', 'var.zgdd.vol', 'var.zgdd.cov', 'var.zprecip.vol', 'var.zprecip.cov'), 
+      c("kartez", "total.samp", "model", "model.name", "model.samp", "clim.years", "main.eff", "main.p", "mainclim.eff", "mainclim.p", "inter.eff", "inter.p", "AIC")]
+    decision.table$dAIC <- decision.table$AIC - min(decision.table$AIC[!decision.table$model %in% c('siteyr.vol', 'siteyr.cov')], na.rm = T)
+    decision.table$dAIC[decision.table$model %in% c('siteyr.vol', 'siteyr.cov')] <- NA
+    cat("  \n\nModel results for decision making:  \n\n")
+    print(kable(decision.table[,c("kartez", "model.name", "model.samp", "clim.years", "main.eff", "main.p", "mainclim.eff", "mainclim.p", "inter.eff", "inter.p", "AIC", "dAIC")], format="pandoc", row.names = F))
+    cat("  \n\n")
+    
+    # Print table with most complete model terms
+    full.table <- new.output.line[
+      new.output.line$model %in% c('invar.vol', 'invar.cov', 'site.vol', 'site.cov', 'var.spei.vol', 'var.spei.cov', 'var.gdd.vol', 'var.gdd.cov', 'var.precip.vol', 'var.precip.cov'), 
+      c("kartez", "total.samp", "model", "model.name", "model.samp", "clim.years", "main.eff", "main.p", "mainclim.eff", "mainclim.p", "inter.eff", "inter.p", "AIC")]
+    full.table$dAIC <- full.table$AIC - min(full.table$AIC, na.rm = T)
+    cat("  \n\nFull model results for allometries:  \n\n")
+    print(kable(full.table[,c("kartez", "model.name", "model.samp", "clim.years", "main.eff", "main.p", "mainclim.eff", "mainclim.p", "inter.eff", "inter.p", "AIC", "dAIC")], format="pandoc", row.names = F))
+    cat("  \n\n")
+    
+    # # Print visreg plot for best model
+    # SPEI.interaction <- GDD.interaction <- precip.interaction <- NULL
+    # if (!is.na(model.comparison$volxclim.dAIC[1]) & 
+    #     model.comparison$volxclim.dAIC[1] <= 2) {
+    #   SPEI.interaction <- 
+    #     visreg2d(lm(Live_Weight ~ 0 + Volume*z.6SPEI, data=se.sp.sub), 
+    #              xvar="Volume", yvar="z.6SPEI", type="conditional", 
+    #              col =  visreg.colors,
+    #              zlim = c(0,ceiling(se.sp.sub$Live_Weight)),
+    #              cex = 0.7, cex.main = 0.7, cex.axis = 0.7, cex.sub = 0.7) }
+    # 
+    # if (!is.na(model.comparison$volxclim.dAIC[2]) & 
+    #     model.comparison$volxclim.dAIC[2] <= 2) {
+    #   GDD.interaction <- 
+    #     visreg2d(lm(Live_Weight ~ 0 + Volume*z.GDD, data=se.sp.sub), 
+    #              xvar="Volume", yvar="z.GDD", type="conditional", 
+    #              col =  visreg.colors,
+    #              zlim = c(0,ceiling(se.sp.sub$Live_Weight)),
+    #              cex = 0.7, cex.main = 0.7, cex.axis = 0.7, cex.sub = 0.7) }
+    # 
+    
+    ### Compare predicted biomass
+    predictions <- NPP.sub[NPP.sub$volume > -1 & NPP.sub$cover > -1 & NPP.sub$season == unique(se.sp.sub$Season) & NPP.sub$site %in% c("B", "C", "G", "P") & NPP.sub$treatment == "C",]
+    if (dim(predictions)[1] > 30) {
+    predictions <- as.data.frame(data.table(predictions[!is.na(predictions$site),])[, list(
+      prev.mass = mean(prev.mass, na.rm=T), 
+      volume = sum(volume, na.rm=T), 
+      cover = sum(cover, na.rm=T),
+      date = mean(as.Date(date, "%Y-%m-%d"), na.rm = T)),
+      by = list(year, season, kartez, site, web, plot, subplot, SiteCluster, season.precip, GDD, SPEI6.thornth)])
+
+    predictions <- merge(predictions, num.quads, by = c("site", "year"))
+    
+    predictions <- unique(as.data.frame(data.table(predictions)[, list(
+      prev.mass = sum(prev.mass, na.rm=T) / num.quads, 
+      volume = sum(volume, na.rm=T) / num.quads, 
+      cover = sum(cover, na.rm=T) / num.quads,
+      date = mean(as.Date(date, "%m/%d/%Y"), na.rm = T)),
+      by = list(year, season, kartez, site, SiteCluster, season.precip, GDD, SPEI6.thornth)]))
+    
+    predictions$prev.mass[predictions$site %in% "P" & predictions$year %in% 2015:2016 & predictions$prev.mass == 0] <- NA
+
+    ifelse(is.null(all.yr.vol.gls), predictions$all.yr.vol <- NA,
+           predictions$all.yr.vol <- 
+             predict(all.yr.vol.gls, na.action = na.pass, 
+                     newdata = data.frame(
+                       Volume = predictions$volume)))
+    ifelse(is.null(all.yr.cov.gls), predictions$all.yr.cov <- NA,
+           predictions$all.yr.cov <- 
+             predict(all.yr.cov.gls, na.action = na.pass, 
+                     newdata = data.frame(
+                       Cover = predictions$cover)))
+    ifelse(is.null(spei6.gls), predictions$spei.vol <- NA,
+           predictions$spei.vol <- 
+             predict(spei6.gls, na.action = na.pass, 
+                     newdata = data.frame(
+                       Volume = predictions$volume, 
+                       SPEI6.thornth = predictions$SPEI6.thornth)))
+    ifelse(is.null(spei6.cov.gls), predictions$spei.cov <- NA,
+           predictions$spei.cov <- 
+             predict(spei6.cov.gls, na.action = na.pass, 
+                     newdata = data.frame(
+                       Cover = predictions$cover, 
+                       SPEI6.thornth = predictions$SPEI6.thornth)))
+    ifelse(is.null(gdd.gls), predictions$gdd.vol <- NA,
+           predictions$gdd.vol <- 
+             predict(gdd.gls, na.action = na.pass, 
+                     newdata = data.frame(
+                       Volume = predictions$volume, 
+                       GDD = predictions$GDD)))
+    ifelse(is.null(gdd.cov.gls), predictions$gdd.cov <- NA,
+           predictions$gdd.cov <- 
+             predict(gdd.cov.gls, na.action = na.pass, 
+                     newdata = data.frame(
+                       Cover = predictions$cover, 
+                       GDD = predictions$GDD)))
+    ifelse(is.null(precip.gls), predictions$precip.vol <- NA,
+           predictions$precip.vol <- 
+             predict(precip.gls, na.action = na.pass, 
+                     newdata = data.frame(
+                       Volume = predictions$volume,
+                       season.precip = predictions$season.precip)))
+    ifelse(is.null(precip.cov.gls), predictions$precip.cov <- NA,
+           predictions$precip.cov <- 
+             predict(precip.cov.gls, na.action = na.pass, 
+                     newdata = data.frame(
+                       Cover = predictions$cover,
+                       season.precip = predictions$season.precip)))
+    
+    
+    predictions <- gather(predictions, key = model, value = pred.mass, all.yr.vol, all.yr.cov, spei.vol, spei.cov, gdd.vol, gdd.cov, precip.vol, precip.cov)
+    predictions$pred.type <- revalue(predictions$model, c(
+      "all.yr.vol" = "volume",
+      "all.yr.cov" = "cover",
+      "spei.vol" = "volume",
+      "spei.cov" = "cover",
+      "gdd.vol" = "volume",
+      "gdd.cov" = "cover",
+      "precip.vol" = "volume",
+      "precip.cov" = "cover"))
+    predictions$dAIC <- as.numeric(as.character(revalue(predictions$model, c(
+      "all.yr.vol" = decision.table$dAIC[
+        decision.table$model == "invar.vol.sub"],
+      "all.yr.cov" = decision.table$dAIC[
+        decision.table$model == "invar.cov.sub"],
+      "spei.vol" = decision.table$dAIC[
+        decision.table$model == "var.zspei.vol"],
+      "spei.cov" = decision.table$dAIC[
+        decision.table$model == "var.zspei.cov"],
+      "gdd.vol" = decision.table$dAIC[
+        decision.table$model == "var.zgdd.vol"],
+      "gdd.cov" = decision.table$dAIC[
+        decision.table$model == "var.zgdd.cov"],
+      "precip.vol" = decision.table$dAIC[
+        decision.table$model == "var.zprecip.vol"],
+      "precip.cov" = decision.table$dAIC[
+        decision.table$model == "var.zprecip.cov"]))))
+      
+    predictions$dAIC <- predictions$dAIC - min(predictions$dAIC, na.rm = T)
+    predictions$dAIC.mod <- (110 - predictions$dAIC)/100
+    predictions$dAIC.mod[predictions$dAIC.mod > 1] <- 1
+    predictions$dAIC.mod[predictions$dAIC.mod < 0] <- 0
+    if(dim(predictions[!is.na(predictions$dAIC) & predictions$dAIC < 100,]) > 1) {
+      # Always show the volume model, at least a little
+      predictions$dAIC.mod[predictions$model == "all.yr.vol" & predictions$dAIC.mod == 0] <- 0.25
+      cat("\nPredicted biomass from best (full) models at Sev core sites. Previously published biomass shown in black.\n")
+      print(
+      ggplot(predictions[!is.na(predictions$dAIC) & predictions$dAIC.mod > 0,], aes(x = date, y = pred.mass, group = model, colour = model, shape = model)) + 
+        theme_bw(base_size = 10) + facet_grid(site~., scales = "free_y") + 
+        theme(panel.grid.minor = element_blank()) +
+        geom_line(aes(y = prev.mass), colour = "black") + 
+        geom_point(size = 3, aes(alpha = dAIC.mod)) + 
+        geom_line(aes(alpha = dAIC.mod), show.legend = F) +
+        ylab("Average Mass (g/m\u00B2)") + xlab("Year") + 
+        scale_alpha(guide = 'none') +
+        scale_color_manual(breaks = c("all.yr.vol", "spei.vol", "gdd.vol", "precip.vol", "all.yr.cov", "spei.cov", "gdd.cov", "precip.cov"), labels = c("Volume", "Volume*SPEI", "Volume*GDD", "Volume*precip", "Cover", "Cover*SPEI", "Cover*GDD", "Cover*precip"), values = model.colors) +
+        scale_shape_manual(breaks = c("all.yr.vol", "spei.vol", "gdd.vol", "precip.vol", "all.yr.cov", "spei.cov", "gdd.cov", "precip.cov"), labels = c("Volume", "Volume*SPEI", "Volume*GDD", "Volume*precip", "Cover", "Cover*SPEI", "Cover*GDD", "Cover*precip"), values = model.shapes) +
+        scale_x_date(date_breaks = "2 years", date_labels = "%Y")
+    )
+    }}
+    
+ifelse(all(is.na(all.output)[1,]), 
+           all.output <- new.output.line,
+           all.output <- merge(all.output, new.output.line, all=T))    
+  }
+}
+
+write.csv(all.output, row.names = F,
+          paste0("~/Desktop/SevPlantBiomass_", 
+                 format(Sys.Date(), format = "%d%b%y"),
+                 ".csv"))
+
+}
+
+
+```
+
+
+
+
+
+
+
+```{r echo = F}
+
+### SHORTCUT TO PRODUCE JUST THE AIC .csv FILE
+
+# The following data will be output, when enough samples are present
+all.output <- 
+  data.frame(
+    kartez = NA,
+    genus = NA,
+    sp.epithet = NA,
+    family = NA,
+    LifeHistory = NA,
+    PhotoPath = NA,
+    FunctionalGroup = NA,
+    season = NA,
+    total.samp = NA,
+    burn.excluded = NA,
+    model = NA,
+    model.samp = NA,
+    clim.years = NA,
+    main.slope = NA,
+    main.p = NA,
+    inter.slope = NA,
+    inter.p = NA,
+    AIC = NA,
+    dAIC = NA)
+
+
+if (poison == "quickie") {
+# Order dataset by species in alphabetical order
+dest.harv <- dest.harv[order(as.character(dest.harv$kartez)),]
+
+# Loop through all species
+for (species in 1:length(unique(dest.harv$kartez))) {
+#for (species in 22:27) {
+#for (species in which(unique(dest.harv$kartez) %in% c("BOER4", "BOGR2", "GUSA2", "PLJA", "ACHY"))) {
+  
+  # Create subset dataframe for that species
+  sp.sub <- unique(dest.harv[
+    dest.harv$kartez == unique(dest.harv$kartez)[species] & 
+      !is.na(dest.harv$Volume) & 
+      !is.na(dest.harv$Live_Weight),
+    c("kartez", "Site", "SiteCluster", "MetStation", "Date", "Year", "Season", "Treatment", "SinceBurn", "Cover", "Height", "Live_Weight", "Volume", "Lankiness", "SPEI6.thornth", "GDD", "season.precip", "z.6SPEI", "z.GDD", "z.precip", "family", "genus", "species", "path", "a_p", "g_f")])
+  
+  # If there are fewer than 3 destructive samples, discontinue analysis and skip to next species
+  if (dim(sp.sub[sp.sub$Season != 1 & !is.na(sp.sub$Live_Weight),])[1] < 5) next
+  
+  # Order dataset by season 
+  sp.sub <- sp.sub[order(sp.sub$Season),]
+
+  # Create a similar subset of the actual NPP data
+  #NPP.sub <- unique(allquadNPP[allquadNPP$kartez == as.character(unique(dest.harv$kartez)[species]),])
+  
+  # Print summary of species' destructive harvest data
+  kartez <- as.character(unique(sp.sub$kartez))
+  family <- as.character(unique(sp.sub$family))
+  genus <- as.character(unique(sp.sub$genus))
+  sp.epithet <- as.character(unique(sp.sub$species))
+  path <- as.character(unique(sp.sub$path))
+  a_p <- as.character(unique(sp.sub$a_p))
+  g_f <- as.character(unique(sp.sub$g_f))
+  
+  # Species:
+  cat("  \n\n### Species:", kartez)
+  # Full taxonomy
+  cat(paste0("\n ***", genus, " ", sp.epithet, "*** (", family, ") - ", a_p, " ", path, " ", g_f))
+  
+  # Relevel Site Clusters
+  sp.sub$SiteCluster <- factor(sp.sub$SiteCluster, 
+  levels = c("CerroMontosa", "BlueGrama", "DeepWell", "FivePoints"))
+  #NPP.sub$SiteCluster <- factor(NPP.sub$SiteCluster, 
+  #levels = c("CerroMontosa", "BlueGrama", "DeepWell", "FivePoints"))
+  
+  # Subset to the first season we'll consider
+  sp.sub <- sp.sub[sp.sub$Season != 1,]
+  for (season in 1:length(unique(sp.sub$Season))) {
+    se.sp.sub <- unique(sp.sub[sp.sub$Season ==
+                                 unique(sp.sub$Season)[season],]) 
+    
+    # Format Season, Year, and Site-Year columns
+    se.sp.sub$Season <- as.factor(se.sp.sub$Season)
+    se.sp.sub$Year <- as.factor(se.sp.sub$Year)
+    se.sp.sub$SiteYear <- as.factor(paste0(se.sp.sub$SiteCluster, se.sp.sub$Year))
+    
+    # Print Season
+    ifelse(unique(se.sp.sub$Season) == 2, 
+           ssn.name <- "spring", 
+           ssn.name <- "fall")
+
+    total.samples <- dim(se.sp.sub)[1]
+    
+    ### Climate-invariant model
+    # First, determine if allometries differ based on years since burn
+    # If yes, exclude "burn treatment" samples from further analysis
+    # If no, include "burn treatment" samples
+    burn.answer <- "n"
+    # Create list of model covariates for this species
+    all.covariates <- unique(se.sp.sub[,c("Year", "SiteYear", "SiteCluster", "Treatment")])
+    trt.cov <- unique(se.sp.sub[,c("Year", "Treatment")])
+    
+    if # require at least 10 samples from burn plots 
+    (length(unique(se.sp.sub$Treatment)) > 1 &
+     length(se.sp.sub$Treatment[se.sp.sub$Treatment == "B"]) > 10) {
+      
+      if # require each treatment to have been sampled twice
+      (length(trt.cov$Treatment[trt.cov$Treatment=="C"]) > 1 &
+       length(trt.cov$Treatment[trt.cov$Treatment=="B"]) > 1 &
+       # require each treatment to have been sampled in overlapping years
+       sum(unique(all.covariates$Year[all.covariates$Treatment=="C"]) %in%
+           unique(all.covariates$Year[all.covariates$Treatment=="B"])) > 0) {
+        burn.pval <- round(anova(gls(Live_Weight ~ 0 + Year + Volume*SinceBurn, data=se.sp.sub[se.sp.sub$Site == "L",], na.action = na.exclude, control=list(singular.ok=T)))["Volume:SinceBurn", "p-value"], 2)
+        
+        if (!is.na(burn.pval) & burn.pval < 0.05) {
+          se.sp.sub <- se.sp.sub[se.sp.sub$Treatment != "B",]
+          burn.answer <- "y"
+        }}}
+    
+    
+    # Determine year- and site- invariant regression
+
+    # Create list of model covariates for this species
+    all.covariates <- unique(se.sp.sub[,c("Year", "SiteYear", "SiteCluster")])
+    # Reset model null values
+    all.yr.vol.model <- all.yr.cov.model <- NULL
+    all.yr.AIC.vol <- all.yr.AIC.cov <- 999999999
+    all.yr.main.vol <- all.yr.main.cov <- NA
+    all.yr.main.p.vol <- all.yr.main.p.cov <- NA    
+    
+    all.yr.samp <- length(!is.na(se.sp.sub$Live_Weight))
+    all.clim.years <- dim(all.covariates)[1]
+    
+
+    # Create invariant model
+    if # require ten samples
+    (length(!is.na(se.sp.sub$Live_Weight)) >= 10) {
+      all.yr.vol.gls <- gls(Live_Weight ~ 0 + Volume, data = se.sp.sub, na.action = na.exclude)
+      all.yr.vol.model <- anova(all.yr.vol.gls, type="marginal") 
+      all.yr.main.vol <- all.yr.vol.gls$coefficients[1]
+      all.yr.main.p.vol <- all.yr.vol.model["Volume", "p-value"]
+      all.yr.AIC.vol <- AIC(all.yr.vol.gls)
+
+      all.yr.cov.gls <- gls(Live_Weight ~ 0 + Cover, data = se.sp.sub, na.action = na.exclude)
+      all.yr.cov.model <- anova(all.yr.cov.gls, type="marginal") 
+      all.yr.main.cov <- all.yr.cov.gls$coefficients[1]
+      all.yr.main.p.cov <- all.yr.cov.model["Cover", "p-value"]
+      all.yr.AIC.cov <- AIC(all.yr.cov.gls)
+    }
+    
+    
+    ### Site specific model
+    
+    # Create list of covariates possible for this species
+    site.covariates <- unique(se.sp.sub[,c("Year", "SiteYear", "SiteCluster")])
+    site.covariates <- ddply(site.covariates, "SiteCluster", function(x) data.frame(num.yrs = length(x$Year)))
+    # Reset model null values
+    site.vol.model <- site.cov.model <- NULL
+    site.main.vol <- site.main.cov <- NA
+    site.main.p.vol  <- site.main.p.cov <- NA
+    site.inter.p.vol <- site.inter.p.cov <- NA    
+    site.AIC.vol <- site.AIC.cov <- 999999999
+
+    site.samp <- length(!is.na(se.sp.sub$Live_Weight))
+    site.clim.years <- dim(site.covariates)[1]
+    
+    if # require 2 sites to be sampled for 3 siteyears each. Otherwise skip to climate models
+    (length(unique(se.sp.sub$SiteCluster[se.sp.sub$SiteCluster %in% site.covariates$SiteCluster[site.covariates$num.yrs >= 2]])) >= 2) {
+      site.vol.gls <- gls(Live_Weight ~ 0 + Volume + SiteCluster, data = se.sp.sub, na.action = na.exclude)
+      site.vol.model <- anova(site.vol.gls, type="marginal") 
+      site.main.vol <- site.vol.gls$coefficients["Volume"]
+      site.main.p.vol <- site.vol.model["Volume", "p-value"]
+      site.inter.p.vol <- site.vol.model["SiteCluster", "p-value"]
+      site.AIC.vol <- AIC(site.vol.gls)
+
+      site.cov.gls <- gls(Live_Weight ~ 0 + Cover + SiteCluster, data = se.sp.sub[se.sp.sub$SiteCluster %in% site.covariates$SiteCluster[site.covariates$num.yrs >= 2],], na.action = na.exclude)
+      site.cov.model <- anova(site.cov.gls, type="marginal") 
+      site.main.cov <- site.cov.gls$coefficients["Cover"]
+      site.main.p.cov <- site.cov.model["Cover", "p-value"]
+      site.inter.p.cov <- site.cov.model["SiteCluster", "p-value"]
+      site.AIC.cov <- AIC(site.cov.gls)
+    }
+    
+    
+    siteyr.samp <- NA
+    siteyr.clim.years <- NA
+    
+    siteyear.vol.model <- siteyear.cov.model <- NULL
+    siteyr.main.vol <- siteyr.main.cov <- NA
+    siteyr.main.p.vol <- siteyr.main.p.cov <- NA
+    siteyr.inter.p.vol <- siteyr.inter.p.cov <- NA
+    siteyr.AIC.vol <- siteyr.AIC.cov <- NA
+
+    ### Climate models
+    
+    # Create null climate models. Need results for z-scored and raw climate variables as well as cover-based models
+    spei6.model <- zspei6.model <- spei6.cov.model <- 
+      gdd.model <- zgdd.model <- gdd.cov.model <- 
+      precip.model <- zprecip.model <- precip.cov.model <- NULL
+    spei.main.vol <- zspei.main.vol <- spei.main.cov <-
+      gdd.main.vol <- zgdd.main.vol <- gdd.main.cov <-
+      precip.main.vol <- zprecip.main.vol <- precip.main.cov <- NA
+    spei.main.p.vol <- zspei.main.p.vol <- spei.main.p.cov <- 
+      gdd.main.p.vol <- zgdd.main.p.vol <- gdd.main.p.cov <- 
+      precip.main.p.vol <- zprecip.main.p.vol <- precip.main.p.cov <- NA 
+    spei.inter.vol <- zspei.inter.vol <- spei.inter.cov <- 
+      gdd.inter.vol <- zgdd.inter.vol <- gdd.inter.cov <- 
+      precip.inter.vol <- zprecip.inter.vol <- precip.inter.cov <- NA
+    spei.inter.p.vol <- zspei.inter.p.vol <- spei.inter.p.cov <- 
+      gdd.inter.p.vol <- zgdd.inter.p.vol <- gdd.inter.p.cov <- 
+      precip.inter.p.vol <- zprecip.inter.p.vol <- precip.inter.p.cov <- NA 
+    spei.AIC.vol <- zspei.AIC.vol <- spei.AIC.cov <- 
+      gdd.AIC.vol <- zgdd.AIC.vol <- gdd.AIC.cov <- 
+      precip.AIC.vol <- zprecip.AIC.vol <- precip.AIC.cov <- 999999999
+    
+    var.samp <- NA
+    var.clim.years <- NA
+
+
+    # If there are at least 10 samples and 2 site-years
+    # calculate each site-year's regression
+    if (length(!is.na(se.sp.sub$Live_Weight)) >= 10 & 
+        length(unique(se.sp.sub[,"SiteYear"])) >= 2) {
+    
+    # Calculate regressions for each site-year
+    annual.model.sub <- unique(se.sp.sub[,c("kartez", "SiteCluster", "SiteYear", "Season", "z.6SPEI", "z.GDD", "z.precip", "SPEI6.thornth", "GDD", "season.precip")])
+    annual.model.sub$lm.slope <- 
+      annual.model.sub$lm.rsquare <- 
+      annual.model.sub$lm.p <- NA
+    for (siteyear in 1:length(unique(annual.model.sub$SiteYear))) {
+      this.siteyear <- unique(annual.model.sub$SiteYear)[siteyear]
+      # skip if there aren't at least two samples for this site-year
+      if (length(se.sp.sub[!is.na(se.sp.sub$SiteYear) & 
+                           se.sp.sub$SiteYear == this.siteyear,]) < 2) next
+      # calculate slope of regression line
+      next.model <- lm(Live_Weight ~ 0 + Volume,
+                       data=se.sp.sub[se.sp.sub$SiteYear == this.siteyear,])
+      annual.model.sub$lm.slope[siteyear] <- next.model$coef
+      annual.model.sub$lm.rsquare[siteyear] <- summary(next.model)$r.squared
+      annual.model.sub$lm.p[siteyear] <- summary(next.model)$coefficients[4]
+      # sample size is minimum number of UNIQUE volume OR cover measurements, not raw sample size
+      annual.model.sub$samp.size[siteyear] <- min(length(!is.na(unique(se.sp.sub$Live_Weight[se.sp.sub$SiteYear == this.siteyear]))),
+      length(!is.na(unique(se.sp.sub$Cover[se.sp.sub$SiteYear == this.siteyear]))))
+    }
+    
+    # Exclude SiteYears with really poor allometric fits
+    se.sp.sub <- se.sp.sub[!se.sp.sub$SiteYear %in% annual.model.sub$SiteYear[annual.model.sub$lm.rsquare < 0.25],]
+    # or not enough data
+    se.sp.sub <- se.sp.sub[se.sp.sub$SiteYear %in% annual.model.sub$SiteYear[annual.model.sub$samp.size >= 3],]
+    
+    # Test Volume:SiteYear interaction
+    # If this has a positive result, we have evidence (and enough samples to assess) that interannual and spatial variation in climate might be driving differences in allometries
+    # If there are at least 10 samples and 2 site-years
+    # calculate each site-year's regression
+    if (length(!is.na(se.sp.sub$Live_Weight)) >= 10 & 
+        length(unique(se.sp.sub[,"SiteYear"])) >= 2) {
+      siteyr.samp <- dim(se.sp.sub)[1]
+      siteyr.clim.years <- length(unique(se.sp.sub$SiteYear))
+      
+      siteyear.vol.gls <- gls(Live_Weight ~ 0 + Volume*SiteYear, data = se.sp.sub, na.action = na.exclude)
+      siteyear.vol.model <- anova(siteyear.vol.gls, type="marginal") 
+      siteyr.main.vol <- siteyear.vol.gls$coefficients["Volume"]
+      siteyr.main.p.vol <- siteyear.vol.model["Volume", "p-value"]
+      siteyr.inter.p.vol <- siteyear.vol.model["Volume:SiteYear", "p-value"]
+      siteyr.AIC.vol <- AIC(siteyear.vol.gls)
+      
+      siteyear.cov.gls <- gls(Live_Weight ~ 0 + Cover*SiteYear, data = se.sp.sub, na.action = na.exclude)
+      siteyear.cov.model <- anova(siteyear.cov.gls, type="marginal") 
+      siteyr.main.cov <- siteyear.cov.gls$coefficients["Cover"]
+      siteyr.main.p.cov <- siteyear.cov.model["Cover", "p-value"]
+      siteyr.inter.p.cov <- siteyear.cov.model["Cover:SiteYear", "p-value"]
+      siteyr.AIC.cov <- AIC(siteyear.vol.gls)
+      
+      
+      # Create list of remaining climate covariates 
+      SPEI.covariates <- unique(se.sp.sub[,c("Year", "SiteCluster", "SiteYear", "SPEI6.thornth", "z.6SPEI")])
+      GDD.covariates <- unique(se.sp.sub[,c("Year", "SiteCluster", "SiteYear", "GDD", "z.GDD")])
+      precip.covariates <- unique(se.sp.sub[,c("Year", "SiteCluster", "SiteYear", "season.precip", "z.precip")])
+      
+      # For climate models, subset to only the years that have full GDD, SPEI, and precip data
+      se.sp.sub <- se.sp.sub[se.sp.sub$SiteYear %in% SPEI.covariates$SiteYear[!is.na(SPEI.covariates$z.6SPEI)] &
+                               se.sp.sub$SiteYear %in% GDD.covariates$SiteYear[!is.na(GDD.covariates$z.GDD)] &
+                               se.sp.sub$SiteYear %in% precip.covariates$SiteYear[!is.na(precip.covariates$z.precip)], ]
+      
+      var.samp <- dim(se.sp.sub)[1]
+      var.clim.years <- length(unique(se.sp.sub$SiteYear))
+      
+      # If all three climate variables can't be compared, discontinue the rest of this analysis
+      if (length(!is.na(SPEI.covariates$z.6SPEI)) > 2 &
+          length(!is.na(GDD.covariates$z.GDD)) > 2 &
+          length(!is.na(precip.covariates$z.precip)) > 2) {
+        
+        
+        # SPEI-6 month model
+        spei6.gls <- gls(Live_Weight ~ 0 + Volume*SPEI6.thornth, data = se.sp.sub, na.action = na.exclude)
+        spei6.model <- anova(spei6.gls, type="marginal") 
+        spei.main.vol <- spei6.gls$coefficients[1]
+        spei.main.p.vol <- spei6.model["Volume", "p-value"]
+        spei.inter.vol <- spei6.gls$coefficients[3]
+        spei.inter.p.vol <- spei6.model["Volume:SPEI6.thornth", "p-value"]
+        spei.AIC.vol <- AIC(spei6.gls)
+        
+        zspei6.gls <- gls(Live_Weight ~ 0 + Volume*z.6SPEI, data = se.sp.sub, na.action = na.exclude)
+        zspei6.model <- anova(zspei6.gls, type="marginal") 
+        zspei.main.vol <- zspei6.gls$coefficients[1]
+        zspei.main.p.vol <- zspei6.model["Volume", "p-value"]
+        zspei.inter.vol <- zspei6.gls$coefficients[3]
+        zspei.inter.p.vol <- zspei6.model["Volume:z.6SPEI", "p-value"]
+        zspei.AIC.vol <- AIC(zspei6.gls)
+        
+        spei6.cov.gls <- gls(Live_Weight ~ 0 + Cover*SPEI6.thornth, data = se.sp.sub, na.action = na.exclude)
+        spei6.cov.model <- anova(spei6.cov.gls, type="marginal") 
+        spei.main.cov <- spei6.cov.gls$coefficients[1]
+        spei.main.p.cov <- spei6.cov.model["Cover", "p-value"]
+        spei.inter.cov <- spei6.cov.gls$coefficients[3]
+        spei.inter.p.cov <- spei6.cov.model["Cover:SPEI6.thornth", "p-value"]
+        spei.AIC.cov <- AIC(spei6.cov.gls)
+        
+        
+        # GDD model
+        gdd.gls <- gls(Live_Weight ~ 0 + Volume*GDD, data = se.sp.sub, na.action = na.exclude)
+        gdd.model <- anova(gdd.gls, type="marginal") 
+        gdd.main.vol <- gdd.gls$coefficients[1]
+        gdd.main.p.vol <- gdd.model["Volume", "p-value"]
+        gdd.inter.vol <- gdd.gls$coefficients[3]
+        gdd.inter.p.vol <- gdd.model["Volume:GDD", "p-value"]
+        gdd.AIC.vol <- AIC(gdd.gls) 
+        
+        zgdd.gls <- gls(Live_Weight ~ 0 + Volume*z.GDD, data = se.sp.sub, na.action = na.exclude)
+        zgdd.model <- anova(zgdd.gls, type="marginal") 
+        zgdd.main.vol <- zgdd.gls$coefficients[1]
+        zgdd.main.p.vol <- zgdd.model["Volume", "p-value"]
+        zgdd.inter.vol <- zgdd.gls$coefficients[3]
+        zgdd.inter.p.vol <- zgdd.model["Volume:z.GDD", "p-value"]
+        zgdd.AIC.vol <- AIC(zgdd.gls)  
+        
+        gdd.cov.gls <- gls(Live_Weight ~ 0 + Cover*GDD, data = se.sp.sub, na.action = na.exclude)
+        gdd.cov.model <- anova(gdd.cov.gls, type="marginal") 
+        gdd.main.cov <- gdd.cov.gls$coefficients[1]
+        gdd.main.p.cov <- gdd.cov.model["Cover", "p-value"]
+        gdd.inter.cov <- gdd.cov.gls$coefficients[3]
+        gdd.inter.p.cov <- gdd.cov.model["Cover:GDD", "p-value"]
+        gdd.AIC.cov <- AIC(gdd.cov.gls) 
+        
+        # precip model 
+        precip.gls <- gls(Live_Weight ~ 0 + Volume*season.precip, data = se.sp.sub, na.action = na.exclude)
+        precip.model <- anova(precip.gls, type="marginal") 
+        precip.main.vol <- precip.gls$coefficients[1]
+        precip.main.p.vol <- precip.model["Volume", "p-value"]
+        precip.inter.vol <- precip.gls$coefficients[3]
+        precip.inter.p.vol <- precip.model["Volume:season.precip", "p-value"]
+        precip.AIC.vol <- AIC(precip.gls) 
+        
+        zprecip.gls <- gls(Live_Weight ~ 0 + Volume*z.precip, data = se.sp.sub, na.action = na.exclude)
+        zprecip.model <- anova(zprecip.gls, type="marginal") 
+        zprecip.main.vol <- zprecip.gls$coefficients[1]
+        zprecip.main.p.vol <- zprecip.model["Volume", "p-value"]
+        zprecip.inter.vol <- zprecip.gls$coefficients[3]
+        zprecip.inter.p.vol <- zprecip.model["Volume:z.precip", "p-value"]
+        zprecip.AIC.vol <- AIC(zprecip.gls) 
+        
+        precip.cov.gls <- gls(Live_Weight ~ 0 + Cover*season.precip, data = se.sp.sub, na.action = na.exclude)
+        precip.cov.model <- anova(precip.cov.gls, type="marginal") 
+        precip.main.cov <- precip.cov.gls$coefficients[1]
+        precip.main.p.cov <- precip.cov.model["Cover", "p-value"]
+        precip.inter.cov <- precip.cov.gls$coefficients[3]
+        precip.inter.p.cov <- precip.cov.model["Cover:season.precip", "p-value"]
+        precip.AIC.cov <- AIC(precip.cov.gls)
+      }
+    }
+    }
+    ### Test whether models are significantly different
+#    predictions.voldata <- NPP.sub[NPP.sub$volume > 0 & NPP.sub$cover > 0,]
+    
+#    predictions.voldata$all.yr.vol.pred <- predict(all.yr.vol.gls, newdata = data.frame(Volume = predictions.voldata$volume), na.action = na.pass)
+#    predictions.voldata$all.yr.cov.pred <- predict(all.yr.cov.gls, newdata = data.frame(Cover = predictions.voldata$cover), na.action = na.pass)
+    
+#     predictions.destdata <- se.sp.sub
+    
+#    predictions.destdata$all.yr.vol.pred <- predict(all.yr.vol.gls, newdata = data.frame(Volume = predictions.destdata$Volume), na.action = na.pass)
+#    predictions.destdata$all.yr.cov.pred <- predict(all.yr.cov.gls, newdata = data.frame(Cover = predictions.destdata$Cover), na.action = na.pass)
+#    predictions.destdata$SPEI.cov.pred <- predict(spei6.cov.gls, newdata = data.frame(Cover = predictions.destdata$Cover, SPEI6.thornth = predictions.destdata$SPEI6.thornth), na.action = na.pass)
+#    predictions.destdata$SPEI.cov.pred[predictions.destdata$SPEI.cov.pred < 0] <- 0
+    
+    
+    
+    
+        # Write out file
+    new.output.line <- 
+      data.frame(
+        kartez = kartez,
+        genus = genus,
+        sp.epithet = sp.epithet,
+        family = family,
+        LifeHistory = a_p,
+        PhotoPath = path,
+        FunctionalGroup = g_f,
+        season = ssn.name,
+        total.samp = total.samples,
+        burn.excluded = burn.answer,
+        model = 
+          c('invar.vol', 'invar.cov',
+            'site.vol', 'site.cov',
+            'siteyr.vol', 'siteyr.cov',
+            'var.spei.vol', 'var.zspei.vol', 'var.spei.cov',
+            'var.gdd.vol', 'var.zgdd.vol', 'var.gdd.cov',
+            'var.precip.vol', 'var.zprecip.vol', 'var.precip.cov'),
+        model.samp = 
+          c(rep(all.yr.samp, 2),
+            rep(site.samp, 2),
+            rep(siteyr.samp, 2),
+            rep(var.samp, 9)),
+        clim.years = 
+          c(rep(all.clim.years, 2), 
+            rep(site.clim.years, 2),
+            rep(siteyr.clim.years, 2),
+            rep(var.clim.years, 9)),
+        main.eff = 
+          c(all.yr.main.vol, all.yr.main.cov,
+            site.main.vol, site.main.cov,
+            siteyr.main.vol, siteyr.main.cov,
+            spei.main.vol, zspei.main.vol, spei.main.cov,
+            gdd.main.vol, zgdd.main.vol, gdd.main.cov,
+            precip.main.vol, zprecip.main.vol, precip.main.cov),
+        main.p = 
+          c(all.yr.main.p.vol, all.yr.main.p.cov,
+            site.main.p.vol, site.main.p.cov,
+            siteyr.main.p.vol, siteyr.main.p.cov,
+            spei.main.p.vol, zspei.main.p.vol, spei.main.p.cov,
+            gdd.main.p.vol, zgdd.main.p.vol, gdd.main.p.cov,
+            precip.main.p.vol, zprecip.main.p.vol, precip.main.p.cov),
+        inter.eff = 
+          c(NA, NA,
+            NA, NA,
+            NA, NA,
+            spei.inter.vol, zspei.inter.vol, spei.inter.cov,
+            gdd.inter.vol, zgdd.inter.vol, gdd.inter.cov,
+            precip.inter.vol, zprecip.inter.vol, precip.inter.cov),
+        inter.p = 
+          c(NA, NA,
+            site.inter.p.vol, site.inter.p.cov,
+            siteyr.inter.p.vol, siteyr.inter.p.cov,
+            spei.inter.p.vol, zspei.inter.p.vol, spei.inter.p.cov,
+            gdd.inter.p.vol, zgdd.inter.p.vol, gdd.inter.p.cov,
+            precip.inter.p.vol, zprecip.inter.p.vol, precip.inter.p.cov),
+        AIC = 
+          c(all.yr.AIC.vol, all.yr.AIC.cov,
+            site.AIC.vol, site.AIC.cov,
+            NA, NA,
+            spei.AIC.vol, zspei.AIC.vol, spei.AIC.cov,
+            gdd.AIC.vol, zgdd.AIC.vol, gdd.AIC.cov,
+            precip.AIC.vol, zprecip.AIC.vol, precip.AIC.cov))
+    
+    new.output.line$AIC[new.output.line$AIC >= 999999999] <- NA
+    new.output.line$dAIC <- new.output.line$AIC - min(new.output.line$AIC, na.rm = T)
+    
+    ### Create table of model results 
+    
+    # Print model comparison table
+    cat("  \n\n")
+    print(kable(new.output.line, format="pandoc"))
+    cat("  \n\n")
+  
+    
+    ifelse(all(is.na(all.output)[1,]), 
+           all.output <- new.output.line,
+           all.output <- merge(all.output, new.output.line, all=T))
+    
+  }}
+
+write.csv(all.output, row.names = F,
+          paste0("~/Desktop/SevPlantBiomass_", 
+                 format(Sys.Date(), format = "%d%b%y"),
+                 ".csv"))
+
+}
+```
+
+
